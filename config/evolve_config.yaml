@@ -12,7 +12,6 @@ evolution:
   num_islands: 1            # Single island (parallel islands require more API budget)
   checkpoint_interval: 1    # Save checkpoint after every generation
   random_seed: 42
-  diff_based_evolution: false  # Use full rewrite; Gemini does not reliably produce SEARCH/REPLACE diffs
 
 # ── LLM configuration ────────────────────────────────────────────────────────
 llm:
@@ -214,3 +213,20 @@ system_message: |
 
   Good luck! Your goal is to discover a gene panel that outperforms random selection
   (~0.25 balanced accuracy) by leveraging Alzheimer's biology and iterative feedback.
+
+  ## CRITICAL: How to Format Your Response
+
+  You MUST use the SEARCH/REPLACE diff format. Return one or more blocks like this:
+
+  <<<<<<< SEARCH
+  # exact code from the current program to replace
+  =======
+  # your new replacement code
+  >>>>>>> REPLACE
+
+  Rules:
+  - The SEARCH section must match the existing code EXACTLY (character for character)
+  - Only modify code between `# EVOLVE-BLOCK-START` and `# EVOLVE-BLOCK-END`
+  - Do NOT include the marker lines themselves in a SEARCH/REPLACE block
+  - You may include multiple SEARCH/REPLACE blocks for multiple changes
+  - Do NOT rewrite the entire file — make targeted changes inside the evolve block only
