@@ -245,9 +245,12 @@ class EvolutionRunner:
         Build a GenerationResult list from an openevolve EvolutionResult.
 
         Search order (stops at first hit):
-          1. Per-generation checkpoint JSON files (checkpoint_gen_*.json or checkpoint_*.json)
-          2. best/best_program_info.json — written by OpenEvolve v0.2+ after the run
-          3. oe_result.best_program.artifacts fallback (last resort)
+          1. Per-generation checkpoint directories: checkpoints/checkpoint_{N}/
+             (OpenEvolve v0.2+ format — one directory per iteration)
+          2. Per-generation checkpoint JSON files (checkpoint_gen_*.json or checkpoint_*.json)
+             (older OpenEvolve pattern)
+          3. best/best_program_info.json — written by OpenEvolve v0.2+ after the run
+          4. oe_result.best_program attributes fallback (last resort)
 
         Args:
             oe_result: openevolve.api.EvolutionResult from run_evolution().
@@ -257,19 +260,37 @@ class EvolutionRunner:
         """
         results: list[GenerationResult] = []
 
-        # 1. Try per-generation checkpoint JSON files (older OpenEvolve pattern).
-        checkpoint_files = sorted(self._output_dir.glob("checkpoint_gen_*.json"))
-        if not checkpoint_files:
-            checkpoint_files = sorted(self._output_dir.glob("checkpoint_*.json"))
+        # 1. Scan checkpoints/checkpoint_{iteration}/ directories (OpenEvolve v0.2+ format).
+        #    Each directory contains metadata.json (best_program_id) and
+        #    programs/{id}.json (metrics + artifacts_json with retained_genes, coefficients).
+        ckpt_root = self._output_dir / "checkpoints"
+        if ckpt_root.is_dir():
+            ckpt_dirs = sorted(
+                [d for d in ckpt_root.iterdir() if d.is_dir() and d.name.startswith("checkpoint_")],
+                key=lambda p: _parse_checkpoint_iteration(p.name),
+            )
+            for i, ckpt_dir in enumerate(ckpt_dirs):
+                try:
+                    gen_result = _parse_checkpoint_dir(i, ckpt_dir)
+                    if gen_result is not None:
+                        results.append(gen_result)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to parse checkpoint dir %s: %s", ckpt_dir, exc)
 
-        for i, ckpt_file in enumerate(checkpoint_files):
-            try:
-                gen_result = _parse_checkpoint(i, ckpt_file)
-                results.append(gen_result)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to parse checkpoint %s: %s", ckpt_file, exc)
+        # 2. Try per-generation checkpoint JSON files (older OpenEvolve pattern).
+        if not results:
+            checkpoint_files = sorted(self._output_dir.glob("checkpoint_gen_*.json"))
+            if not checkpoint_files:
+                checkpoint_files = sorted(self._output_dir.glob("checkpoint_*.json"))
 
-        # 2. Try best/best_program_info.json (OpenEvolve v0.2+ saves this after the run).
+            for i, ckpt_file in enumerate(checkpoint_files):
+                try:
+                    gen_result = _parse_checkpoint(i, ckpt_file)
+                    results.append(gen_result)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to parse checkpoint %s: %s", ckpt_file, exc)
+
+        # 3. Try best/best_program_info.json (OpenEvolve v0.2+ saves this after the run).
         if not results:
             best_info_path = self._output_dir / "best" / "best_program_info.json"
             if best_info_path.exists():
@@ -279,7 +300,7 @@ class EvolutionRunner:
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Failed to parse %s: %s", best_info_path, exc)
 
-        # 3. Last-resort fallback: read from oe_result object attributes.
+        # 4. Last-resort fallback: read from oe_result object attributes.
         if not results and oe_result is not None:
             best_prog = getattr(oe_result, "best_program", None)
             artifacts = {}
@@ -449,6 +470,126 @@ def _parse_best_program_info(gen_id: int, info_path: Path) -> GenerationResult:
         coefficients=coefficients,
         all_scores=[score],
         timestamp=data.get("timestamp") or _utc_now(),
+    )
+
+
+def _parse_checkpoint_iteration(dir_name: str) -> int:
+    """
+    Extract the iteration number from a checkpoint directory name.
+
+    OpenEvolve names checkpoint directories as 'checkpoint_{N}' where N is
+    the iteration number.  Returns 0 for any name that doesn't match.
+
+    Args:
+        dir_name: Directory name, e.g. 'checkpoint_3'.
+
+    Returns:
+        Parsed integer iteration, or 0 on failure.
+    """
+    try:
+        return int(dir_name.rsplit("_", 1)[-1])
+    except (ValueError, IndexError):
+        return 0
+
+
+def _parse_checkpoint_dir(gen_id: int, ckpt_dir: Path) -> GenerationResult | None:
+    """
+    Parse an OpenEvolve v0.2+ checkpoint directory into a GenerationResult.
+
+    Each checkpoint directory (checkpoints/checkpoint_{N}/) contains:
+      - metadata.json: has best_program_id, last_iteration
+      - programs/{id}.json: full Program with metrics + artifacts_json
+      - best_program_info.json: metrics only (no artifacts — used as fallback)
+
+    Artifacts (retained_genes, coefficients, selected_genes) are stored in
+    programs/{id}.json under the artifacts_json field (JSON-serialised dict).
+
+    Args:
+        gen_id: Zero-based index to assign as the generation_id.
+        ckpt_dir: Path to the checkpoint directory.
+
+    Returns:
+        GenerationResult populated from the checkpoint, or None on critical failure.
+    """
+    # Step 1: Read metadata to find the best_program_id.
+    metadata_path = ckpt_dir / "metadata.json"
+    best_program_id: str | None = None
+
+    if metadata_path.exists():
+        try:
+            with open(metadata_path) as fh:
+                meta = json.load(fh)
+            best_program_id = meta.get("best_program_id")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Could not read %s: %s", metadata_path, exc)
+
+    # Step 2: Read best_program_info.json for score + timestamp.
+    best_info_path = ckpt_dir / "best_program_info.json"
+    score = 0.0
+    timestamp = _utc_now()
+
+    if best_info_path.exists():
+        try:
+            with open(best_info_path) as fh:
+                info = json.load(fh)
+            metrics = info.get("metrics", {}) or {}
+            score = float(
+                metrics.get("primary")
+                or metrics.get("balanced_accuracy")
+                or metrics.get("aggregate_score", 0.0)
+                or 0.0
+            )
+            timestamp = info.get("timestamp") or timestamp
+            if best_program_id is None:
+                best_program_id = info.get("id")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Could not read %s: %s", best_info_path, exc)
+
+    # Step 3: Load the full program JSON for artifacts (retained_genes, coefficients, …).
+    artifacts: dict = {}
+    if best_program_id:
+        program_path = ckpt_dir / "programs" / f"{best_program_id}.json"
+        if program_path.exists():
+            try:
+                with open(program_path) as fh:
+                    prog_data = json.load(fh)
+
+                # Override score from the program metrics if available.
+                prog_metrics = prog_data.get("metrics", {}) or {}
+                prog_score = float(
+                    prog_metrics.get("primary")
+                    or prog_metrics.get("balanced_accuracy")
+                    or prog_metrics.get("aggregate_score", 0.0)
+                    or 0.0
+                )
+                if prog_score > 0:
+                    score = prog_score
+
+                # Parse artifacts_json (small artifacts stored inline as JSON string).
+                artifacts_json = prog_data.get("artifacts_json")
+                if artifacts_json:
+                    try:
+                        artifacts = json.loads(artifacts_json)
+                    except (json.JSONDecodeError, TypeError) as exc:
+                        logger.debug("Could not decode artifacts_json in %s: %s", program_path, exc)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Could not read program file %s: %s", program_path, exc)
+
+    raw_coefs = artifacts.get("coefficients", {})
+    coefficients = (
+        {k: float(v) for k, v in raw_coefs.items()}
+        if isinstance(raw_coefs, dict)
+        else {}
+    )
+
+    return GenerationResult(
+        generation_id=gen_id,
+        best_score=score,
+        best_genes=list(artifacts.get("selected_genes", [])),
+        retained_genes=list(artifacts.get("retained_genes", [])),
+        coefficients=coefficients,
+        all_scores=[score],
+        timestamp=timestamp,
     )
 
 

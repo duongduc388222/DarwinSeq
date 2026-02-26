@@ -508,6 +508,82 @@ class TestEvolutionRunner:
         assert result.retained_genes == []
         assert result.coefficients == {}
 
+    def test_parse_checkpoint_iteration(self):
+        """_parse_checkpoint_iteration extracts the integer from 'checkpoint_N' names."""
+        from src.evolve import _parse_checkpoint_iteration
+
+        assert _parse_checkpoint_iteration("checkpoint_0") == 0
+        assert _parse_checkpoint_iteration("checkpoint_3") == 3
+        assert _parse_checkpoint_iteration("checkpoint_10") == 10
+        # Fallback for unexpected format
+        assert _parse_checkpoint_iteration("garbage") == 0
+
+    def test_parse_checkpoint_dir_full(self, tmp_path):
+        """_parse_checkpoint_dir reads metadata + program JSON to extract score and artifacts."""
+        from src.evolve import _parse_checkpoint_dir
+
+        prog_id = "abc-123"
+        ckpt_dir = tmp_path / "checkpoint_2"
+        (ckpt_dir / "programs").mkdir(parents=True)
+
+        # Write metadata.json
+        (ckpt_dir / "metadata.json").write_text(json.dumps({
+            "best_program_id": prog_id,
+            "last_iteration": 2,
+        }))
+
+        # Write best_program_info.json (score only, no artifacts)
+        (ckpt_dir / "best_program_info.json").write_text(json.dumps({
+            "id": prog_id,
+            "metrics": {"primary": 0.35, "balanced_accuracy": 0.35},
+            "timestamp": 1234567890.0,
+        }))
+
+        # Write programs/{id}.json with artifacts_json
+        import json as _json
+        artifacts = {
+            "selected_genes": ["APOE", "TREM2", "MAPT"],
+            "retained_genes": ["APOE", "TREM2"],
+            "coefficients": {"APOE": 0.5, "TREM2": 0.3},
+            "suggestions": ["Replace low-coef genes"],
+        }
+        prog_data = {
+            "id": prog_id,
+            "code": "def select_genes(*a): pass",
+            "metrics": {"primary": 0.35},
+            "artifacts_json": _json.dumps(artifacts),
+        }
+        (ckpt_dir / "programs" / f"{prog_id}.json").write_text(_json.dumps(prog_data))
+
+        result = _parse_checkpoint_dir(2, ckpt_dir)
+
+        assert result is not None
+        assert result.generation_id == 2
+        assert abs(result.best_score - 0.35) < 1e-9
+        assert result.best_genes == ["APOE", "TREM2", "MAPT"]
+        assert result.retained_genes == ["APOE", "TREM2"]
+        assert abs(result.coefficients["APOE"] - 0.5) < 1e-9
+
+    def test_parse_checkpoint_dir_no_program_file(self, tmp_path):
+        """_parse_checkpoint_dir returns result with empty artifacts when program JSON is absent."""
+        from src.evolve import _parse_checkpoint_dir
+
+        ckpt_dir = tmp_path / "checkpoint_1"
+        ckpt_dir.mkdir(parents=True)
+
+        # Only best_program_info.json present (no programs/ dir, no metadata.json)
+        (ckpt_dir / "best_program_info.json").write_text(json.dumps({
+            "metrics": {"primary": 0.22},
+        }))
+
+        result = _parse_checkpoint_dir(1, ckpt_dir)
+
+        assert result is not None
+        assert abs(result.best_score - 0.22) < 1e-9
+        assert result.best_genes == []
+        assert result.retained_genes == []
+        assert result.coefficients == {}
+
     def test_build_openevolve_config_overrides_iterations(self, config_file):
         """_build_openevolve_config should apply n_generations override."""
         from src.evolve import EvolutionRunner
