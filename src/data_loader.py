@@ -403,8 +403,13 @@ class DataLoader:
                 row_vals = f["X/data"][ds:de]
 
                 # Vectorised binary-search for all requested gene columns.
+                # Clip pos before indexing: np.searchsorted can return
+                # len(row_cols) (insert-at-end), and NumPy evaluates both
+                # sides of & eagerly, so row_cols[pos] would raise IndexError
+                # without the clip.
                 pos = np.searchsorted(row_cols, valid_cols)
-                found = (pos < len(row_cols)) & (row_cols[pos] == valid_cols)
+                safe_pos = np.minimum(pos, len(row_cols) - 1)
+                found = (pos < len(row_cols)) & (row_cols[safe_pos] == valid_cols)
                 result[i, valid_j[found]] = row_vals[pos[found]]
 
         return pd.DataFrame(result, index=cell_barcodes, columns=gene_list)

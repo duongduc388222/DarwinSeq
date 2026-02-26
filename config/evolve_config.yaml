@@ -19,6 +19,11 @@ llm:
   primary_weight: 1.0
   temperature: 0.3          # Low temperature for focused, biology-grounded responses
   max_tokens: 8000
+  # Gemini via the OpenAI-compatible endpoint.
+  # api_key is resolved at runtime from the OPENAI_API_KEY environment variable
+  # (loaded from .env by evolve.py via python-dotenv).
+  api_base: "https://generativelanguage.googleapis.com/v1beta/openai/"
+  api_key: "${OPENAI_API_KEY}"
 
 # ── File paths (relative to project root) ────────────────────────────────────
 paths:

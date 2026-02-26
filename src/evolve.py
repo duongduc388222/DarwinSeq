@@ -23,6 +23,16 @@ from pathlib import Path
 
 import yaml
 
+# Load .env file so OPENAI_API_KEY (and other secrets) are available as
+# environment variables before OpenEvolve reads them via ${VAR} expansion.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+
+    _dotenv_path = Path(__file__).parent.parent / ".env"
+    _load_dotenv(_dotenv_path, override=False)
+except ImportError:
+    pass  # python-dotenv not installed; rely on env vars being set externally
+
 logger = logging.getLogger(__name__)
 
 
