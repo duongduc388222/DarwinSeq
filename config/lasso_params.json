@@ -1,0 +1,14 @@
+{
+  "_notes": "Fixed LASSO hyperparameters for the SEA-AD DREAM Challenge evaluator. Alpha is a placeholder (0.01) pending confirmation from the reference paper. All other parameters follow common DREAM challenge conventions: one Lasso per pathology target, StandardScaler normalization, Pearson correlation as the per-target scoring metric.",
+  "model_type": "Lasso",
+  "fit_one_per_target": true,
+  "alpha": 1,
+  "fit_intercept": true,
+  "max_iter": 10000,
+  "random_state": 42,
+  "scaler": "StandardScaler",
+  "scoring_metric": "pearson_r",
+  "aggregate_fn": "mean",
+  "nan_policy": "drop_per_target",
+  "coef_threshold": 1e-10
+}

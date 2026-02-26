@@ -1,0 +1,18 @@
+# Core data handling
+anndata>=0.10.0
+scanpy>=1.10.0
+numpy>=1.26.0
+pandas>=2.1.0
+scipy>=1.12.0
+h5py>=3.10.0
+hdf5plugin>=4.3.0  # registers blosc/lzf/zstd HDF5 filters for reading compressed .h5ad files
+
+# ML
+scikit-learn>=1.4.0
+
+# Visualization
+matplotlib>=3.8.0
+seaborn>=0.13.0
+
+# Testing
+pytest>=8.0.0

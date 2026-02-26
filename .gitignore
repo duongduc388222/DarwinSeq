@@ -1,0 +1,47 @@
+# Environment
+.env
+.env.*
+venv/
+.venv/
+env/
+
+# Claude Code
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.pytest_cache/
+
+# Data (large files)
+data/
+
+# Results (regenerable)
+results/
+
+# Project docs / planning (local only)
+milestones/
+tmp/
+notebooks/
+CLAUDE.md
+
+# Logs
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
