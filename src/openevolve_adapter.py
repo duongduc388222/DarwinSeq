@@ -98,6 +98,13 @@ def evaluate_stage1(program_path: str) -> EvaluationResult:
             artifacts={"error": True, "error_message": err_msg},
         )
 
+
+# OpenEvolve requires a module-level ``evaluate`` function to pass the
+# _load_evaluation_function check at controller init time.
+# ``evaluate_stage1`` is also present so OpenEvolve uses the cascade path when
+# cascade_evaluation is enabled.
+evaluate = evaluate_stage1
+
 # Default number of cells to sample per evaluation run.
 DEFAULT_N_CELLS = 100
 
