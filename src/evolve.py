@@ -244,9 +244,10 @@ class EvolutionRunner:
         """
         Build a GenerationResult list from an openevolve EvolutionResult.
 
-        Parses any per-generation checkpoint files written to the output_dir.
-        Falls back to a single result from oe_result.best_program if no
-        checkpoints are found.
+        Search order (stops at first hit):
+          1. Per-generation checkpoint JSON files (checkpoint_gen_*.json or checkpoint_*.json)
+          2. best/best_program_info.json — written by OpenEvolve v0.2+ after the run
+          3. oe_result.best_program.artifacts fallback (last resort)
 
         Args:
             oe_result: openevolve.api.EvolutionResult from run_evolution().
@@ -256,10 +257,9 @@ class EvolutionRunner:
         """
         results: list[GenerationResult] = []
 
-        # Try per-generation checkpoint files first.
+        # 1. Try per-generation checkpoint JSON files (older OpenEvolve pattern).
         checkpoint_files = sorted(self._output_dir.glob("checkpoint_gen_*.json"))
         if not checkpoint_files:
-            # OpenEvolve may use a different naming pattern.
             checkpoint_files = sorted(self._output_dir.glob("checkpoint_*.json"))
 
         for i, ckpt_file in enumerate(checkpoint_files):
@@ -269,12 +269,33 @@ class EvolutionRunner:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to parse checkpoint %s: %s", ckpt_file, exc)
 
+        # 2. Try best/best_program_info.json (OpenEvolve v0.2+ saves this after the run).
+        if not results:
+            best_info_path = self._output_dir / "best" / "best_program_info.json"
+            if best_info_path.exists():
+                try:
+                    results.append(_parse_best_program_info(0, best_info_path))
+                    logger.info("Loaded result from %s", best_info_path)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to parse %s: %s", best_info_path, exc)
+
+        # 3. Last-resort fallback: read from oe_result object attributes.
         if not results and oe_result is not None:
-            # Fall back: build one result from the best program.
             best_prog = getattr(oe_result, "best_program", None)
             artifacts = {}
             if best_prog is not None:
+                # Try metrics dict on the program object first.
+                prog_metrics = getattr(best_prog, "metrics", {}) or {}
                 artifacts = getattr(best_prog, "artifacts", {}) or {}
+                score = float(
+                    prog_metrics.get("primary")
+                    or prog_metrics.get("balanced_accuracy")
+                    or 0.0
+                )
+            else:
+                prog_metrics = {}
+                score = 0.0
+
             raw_coefs = artifacts.get("coefficients", {})
             coefs = (
                 {k: float(v) for k, v in raw_coefs.items()}
@@ -284,11 +305,11 @@ class EvolutionRunner:
             results.append(
                 GenerationResult(
                     generation_id=0,
-                    best_score=float(getattr(oe_result, "best_score", 0.0)),
+                    best_score=score,
                     best_genes=list(artifacts.get("selected_genes", [])),
                     retained_genes=list(artifacts.get("retained_genes", [])),
                     coefficients=coefs,
-                    all_scores=[float(getattr(oe_result, "best_score", 0.0))],
+                    all_scores=[score],
                     timestamp=_utc_now(),
                 )
             )
@@ -382,6 +403,53 @@ def generate_summary(
         "best_score": best.best_score,
         "baseline_mean_score": baseline_mean_score,
     }
+
+
+def _parse_best_program_info(gen_id: int, info_path: Path) -> GenerationResult:
+    """
+    Parse an OpenEvolve best/best_program_info.json file into a GenerationResult.
+
+    OpenEvolve v0.2+ writes this file after the run with the best program's
+    metrics and artifacts. The score is taken from metrics['primary'] (or
+    metrics['balanced_accuracy'] as fallback) — NOT from oe_result.best_score,
+    which is an internal OpenEvolve counter unrelated to our fitness metric.
+
+    Args:
+        gen_id: Generation index to assign to the result.
+        info_path: Path to best_program_info.json.
+
+    Returns:
+        GenerationResult populated from the info file.
+    """
+    with open(info_path) as fh:
+        data = json.load(fh)
+
+    metrics = data.get("metrics", {}) or {}
+    artifacts = data.get("artifacts", {}) or {}
+
+    score = float(
+        metrics.get("primary")
+        or metrics.get("balanced_accuracy")
+        or metrics.get("aggregate_score", 0.0)
+        or 0.0
+    )
+
+    raw_coefs = artifacts.get("coefficients", {})
+    coefficients = (
+        {k: float(v) for k, v in raw_coefs.items()}
+        if isinstance(raw_coefs, dict)
+        else {}
+    )
+
+    return GenerationResult(
+        generation_id=gen_id,
+        best_score=score,
+        best_genes=list(artifacts.get("selected_genes", [])),
+        retained_genes=list(artifacts.get("retained_genes", [])),
+        coefficients=coefficients,
+        all_scores=[score],
+        timestamp=data.get("timestamp") or _utc_now(),
+    )
 
 
 def _parse_checkpoint(gen_id: int, checkpoint_path: Path) -> GenerationResult:

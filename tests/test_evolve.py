@@ -465,6 +465,49 @@ class TestEvolutionRunner:
         assert restored["best_score"] == pytest.approx(0.65)
         assert restored["best_genes"] == ["A", "B", "C"]
 
+    def test_parse_best_program_info(self, tmp_path):
+        """_parse_best_program_info extracts score and artifacts from best_program_info.json."""
+        from src.evolve import _parse_best_program_info
+
+        info = {
+            "metrics": {
+                "primary": 0.2269,
+                "balanced_accuracy": 0.2269,
+                "macro_f1": 0.213,
+            },
+            "artifacts": {
+                "selected_genes": ["APOE", "TREM2", "MAPT"],
+                "retained_genes": ["APOE", "TREM2"],
+                "coefficients": {"APOE": 0.45, "TREM2": 0.31},
+                "suggestions": ["Replace low-coef genes"],
+            },
+        }
+        info_path = tmp_path / "best_program_info.json"
+        info_path.write_text(json.dumps(info))
+
+        result = _parse_best_program_info(0, info_path)
+
+        assert abs(result.best_score - 0.2269) < 1e-9
+        assert result.best_genes == ["APOE", "TREM2", "MAPT"]
+        assert result.retained_genes == ["APOE", "TREM2"]
+        assert abs(result.coefficients["APOE"] - 0.45) < 1e-9
+        assert result.generation_id == 0
+
+    def test_parse_best_program_info_missing_artifacts(self, tmp_path):
+        """_parse_best_program_info handles missing artifacts gracefully."""
+        from src.evolve import _parse_best_program_info
+
+        info = {"metrics": {"primary": 0.31}}
+        info_path = tmp_path / "best_program_info.json"
+        info_path.write_text(json.dumps(info))
+
+        result = _parse_best_program_info(1, info_path)
+
+        assert abs(result.best_score - 0.31) < 1e-9
+        assert result.best_genes == []
+        assert result.retained_genes == []
+        assert result.coefficients == {}
+
     def test_build_openevolve_config_overrides_iterations(self, config_file):
         """_build_openevolve_config should apply n_generations override."""
         from src.evolve import EvolutionRunner
