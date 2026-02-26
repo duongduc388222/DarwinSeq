@@ -291,6 +291,59 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def generate_summary(
+    results: list,
+    baseline_mean_score: float | None = None,
+) -> dict:
+    """
+    Build a JSON-serializable summary dict from a list of GenerationResult objects.
+
+    Args:
+        results: Per-generation results from EvolutionRunner.run().
+        baseline_mean_score: Optional random-baseline aggregate score for comparison.
+
+    Returns:
+        Dict with keys:
+            - generations: list of per-gen dicts {gen, aggregate_score, n_retained, top_genes}
+            - best_generation: int index of the highest-scoring generation (None if empty)
+            - best_score: float, the highest aggregate_score seen (None if empty)
+            - baseline_mean_score: float or None
+    """
+    if not results:
+        return {
+            "generations": [],
+            "best_generation": None,
+            "best_score": None,
+            "baseline_mean_score": baseline_mean_score,
+        }
+
+    gen_summaries = []
+    for r in results:
+        if r.coefficients:
+            top_genes = sorted(
+                r.retained_genes,
+                key=lambda g: r.coefficients.get(g, 0.0),
+                reverse=True,
+            )[:10]
+        else:
+            top_genes = list(r.retained_genes[:10])
+
+        gen_summaries.append({
+            "gen": r.generation_id,
+            "aggregate_score": r.best_score,
+            "n_retained": len(r.retained_genes),
+            "top_genes": top_genes,
+        })
+
+    best = max(results, key=lambda r: r.best_score)
+    return {
+        "generations": gen_summaries,
+        "best_generation": best.generation_id,
+        "best_score": best.best_score,
+        "baseline_mean_score": baseline_mean_score,
+    }
+
+
 def _parse_checkpoint(gen_id: int, checkpoint_path: Path) -> GenerationResult:
     """
     Parse an OpenEvolve checkpoint JSON file into a GenerationResult.

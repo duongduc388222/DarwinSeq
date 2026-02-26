@@ -60,17 +60,23 @@ class GeneSelectorEvaluator:
         config_path: str | None = None,
         n_cells: int = DEFAULT_N_CELLS,
         sample_seed: int = 42,
+        max_retries: int = 3,
     ) -> None:
         self._data_path = data_path or DEFAULT_DATA_PATH
         self._vocab_path = vocab_path or DEFAULT_VOCAB_PATH
         self._config_path = config_path or DEFAULT_CONFIG_PATH
         self._n_cells = n_cells
         self._sample_seed = sample_seed
+        self._max_retries = max_retries
 
         # Lazily loaded on first evaluate call.
         self._data_loader: DataLoader | None = None
         self._vocab: GeneVocabulary | None = None
         self._evaluator: ADNCEvaluator | None = None
+
+        # Fallback guardrail state.
+        self._last_valid_selection: list[str] | None = None
+        self._consecutive_failures: int = 0
 
     # ──────────────────────────────────────────────────────────────────────────
     # Public API (OpenEvolve interface)
@@ -115,13 +121,30 @@ class GeneSelectorEvaluator:
             # ── Call the evolved function ─────────────────────────────────────
             selected_genes = select_genes_func(gene_vocab_list, all_genes_list)
 
-            # ── Validate output ───────────────────────────────────────────────
+            # ── Validate output (with fallback guardrail) ─────────────────────
             validation_error = self._validate_selection(selected_genes, all_genes_list)
             if validation_error:
-                return EvaluationResult(
-                    metrics={"primary": 0.0},
-                    artifacts={"error": True, "error_message": validation_error},
-                )
+                self._consecutive_failures += 1
+                if (
+                    self._consecutive_failures >= self._max_retries
+                    and self._last_valid_selection is not None
+                ):
+                    logger.warning(
+                        "Validation failed %d consecutive time(s); substituting "
+                        "last valid selection.",
+                        self._consecutive_failures,
+                    )
+                    selected_genes = self._last_valid_selection
+                    self._consecutive_failures = 0
+                    # Fall through to pipeline with the fallback selection.
+                else:
+                    return EvaluationResult(
+                        metrics={"primary": 0.0},
+                        artifacts={"error": True, "error_message": validation_error},
+                    )
+            else:
+                self._consecutive_failures = 0
+                self._last_valid_selection = selected_genes
 
             # ── Run pipeline ──────────────────────────────────────────────────
             sampler = CellSampler(
