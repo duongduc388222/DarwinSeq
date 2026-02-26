@@ -24,6 +24,8 @@ llm:
   # (loaded from .env by evolve.py via python-dotenv).
   api_base: "https://generativelanguage.googleapis.com/v1beta/openai/"
   api_key: "${OPENAI_API_KEY}"
+  timeout: 300          # Seconds before a single LLM call is aborted (default: 60)
+  retries: 5            # Retry attempts per LLM call on timeout/error (default: 3)
 
 # ── File paths (relative to project root) ────────────────────────────────────
 paths:

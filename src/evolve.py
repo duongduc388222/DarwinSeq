@@ -224,6 +224,8 @@ class EvolutionRunner:
             weight=float(llm_cfg.get("primary_weight", 1.0)),
             temperature=float(llm_cfg.get("temperature", 0.7)),
             max_tokens=int(llm_cfg.get("max_tokens", 4096)),
+            timeout=int(llm_cfg["timeout"]) if llm_cfg.get("timeout") is not None else 300,
+            retries=int(llm_cfg["retries"]) if llm_cfg.get("retries") is not None else 5,
         )
         config.llm.models = [model]
 

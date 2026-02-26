@@ -220,11 +220,12 @@ class GeneRetentionAnalyzer:
     def rank_genes(self) -> pd.DataFrame:
         """
         Rank genes by a composite score that rewards both frequent LLM selection
-        and frequent LASSO retention.
+        and frequent LASSO-for-classification retention.
 
         composite_score = selection_freq × retention_freq
 
-        Also includes mean_coef from coefficient stats for additional ranking signal.
+        Also includes mean_coef (higher = stronger ADNC discriminator on average)
+        and std_coef (lower = more consistent signal across generations).
 
         Returns:
             DataFrame with columns:
@@ -232,13 +233,17 @@ class GeneRetentionAnalyzer:
               - selection_freq (float): Fraction of generations in which LLM selected it.
               - retention_freq (float): Fraction of generations in which LASSO retained it.
               - composite_score (float): selection_freq × retention_freq.
-              - mean_coef (float): Mean |LASSO coefficient| across all generations.
+              - mean_coef (float): Mean sum-of-|coef| across all generations.
+              - std_coef (float): Std dev of sum-of-|coef|; lower = more consistent.
             Sorted by composite_score descending (ties broken by mean_coef).
             Empty DataFrame if no results loaded.
         """
         if not self._records:
             return pd.DataFrame(
-                columns=["gene", "selection_freq", "retention_freq", "composite_score", "mean_coef"]
+                columns=[
+                    "gene", "selection_freq", "retention_freq",
+                    "composite_score", "mean_coef", "std_coef",
+                ]
             )
 
         sel_df = self.compute_selection_frequency()
@@ -247,7 +252,8 @@ class GeneRetentionAnalyzer:
 
         sel_map = dict(zip(sel_df["gene"], sel_df["selection_freq"]))
         ret_map = dict(zip(ret_df["gene"], ret_df["retention_freq"]))
-        coef_map = dict(zip(coef_df["gene"], coef_df["mean_coef"]))
+        coef_mean_map = dict(zip(coef_df["gene"], coef_df["mean_coef"]))
+        coef_std_map = dict(zip(coef_df["gene"], coef_df["std_coef"]))
 
         # Union of all genes seen in any generation.
         all_genes: set[str] = set()
@@ -265,18 +271,97 @@ class GeneRetentionAnalyzer:
                     "selection_freq": s,
                     "retention_freq": r,
                     "composite_score": s * r,
-                    "mean_coef": coef_map.get(gene, 0.0),
+                    "mean_coef": coef_mean_map.get(gene, 0.0),
+                    "std_coef": coef_std_map.get(gene, 0.0),
                 }
             )
 
         df = pd.DataFrame(
             rows,
-            columns=["gene", "selection_freq", "retention_freq", "composite_score", "mean_coef"],
+            columns=[
+                "gene", "selection_freq", "retention_freq",
+                "composite_score", "mean_coef", "std_coef",
+            ],
         )
         return (
             df.sort_values(["composite_score", "mean_coef"], ascending=[False, False])
             .reset_index(drop=True)
         )
+
+    def compare_evolution_vs_baseline(self, baseline_scores: list[float]) -> dict:
+        """
+        Compare evolution generation scores against a random-baseline distribution
+        using a one-sided Mann-Whitney U test (H1: evolution > baseline).
+
+        Both evolution and baseline scores are balanced accuracy values (0–1) from
+        ADNC classification. Uses scipy.stats.mannwhitneyu which is included in the
+        project's dependencies.
+
+        Args:
+            baseline_scores: List of balanced-accuracy scores from the random-baseline
+                             run (e.g. from results/baseline/all_runs.json).
+
+        Returns:
+            Dict with keys:
+              - evolution_mean (float): Mean balanced accuracy of evolution generations.
+              - baseline_mean (float): Mean balanced accuracy of baseline runs.
+              - n_evolution (int): Number of evolution generations.
+              - n_baseline (int): Number of baseline runs.
+              - statistic (float): Mann-Whitney U statistic.
+              - p_value (float): One-sided p-value (evolution > baseline).
+              - effect_size_rank_biserial (float): Rank-biserial correlation (0–1 range;
+                  positive = evolution tends to be higher).
+              - evolution_ci_95 (tuple[float, float]): 2.5th and 97.5th percentile of
+                  evolution scores (NaN, NaN if fewer than 3 generations).
+              - baseline_ci_95 (tuple[float, float]): Same for baseline scores.
+            All numeric fields are NaN if either list is empty.
+        """
+        from scipy import stats
+
+        nan_result = {
+            "evolution_mean": float("nan"),
+            "baseline_mean": float("nan"),
+            "n_evolution": len(self._records),
+            "n_baseline": len(baseline_scores),
+            "statistic": float("nan"),
+            "p_value": float("nan"),
+            "effect_size_rank_biserial": float("nan"),
+            "evolution_ci_95": (float("nan"), float("nan")),
+            "baseline_ci_95": (float("nan"), float("nan")),
+        }
+
+        evolution_scores = self.generation_scores
+        if not evolution_scores or not baseline_scores:
+            return nan_result
+
+        n1, n2 = len(evolution_scores), len(baseline_scores)
+        stat, p_value = stats.mannwhitneyu(
+            evolution_scores, baseline_scores, alternative="greater"
+        )
+
+        # Rank-biserial correlation: positive when evolution tends to be higher.
+        effect_size = float(1 - (2 * stat) / (n1 * n2))
+
+        evo_ci = (
+            (float(np.percentile(evolution_scores, 2.5)), float(np.percentile(evolution_scores, 97.5)))
+            if n1 >= 3 else (float("nan"), float("nan"))
+        )
+        base_ci = (
+            (float(np.percentile(baseline_scores, 2.5)), float(np.percentile(baseline_scores, 97.5)))
+            if n2 >= 3 else (float("nan"), float("nan"))
+        )
+
+        return {
+            "evolution_mean": float(np.mean(evolution_scores)),
+            "baseline_mean": float(np.mean(baseline_scores)),
+            "n_evolution": n1,
+            "n_baseline": n2,
+            "statistic": float(stat),
+            "p_value": float(p_value),
+            "effect_size_rank_biserial": effect_size,
+            "evolution_ci_95": evo_ci,
+            "baseline_ci_95": base_ci,
+        }
 
     # ──────────────────────────────────────────────────────────────────────────
     # Properties
