@@ -471,7 +471,8 @@ class TestEvolutionRunner:
 
         runner = EvolutionRunner(config_file)
         config = runner._build_openevolve_config(n_generations=3)
-        assert config["evolution"]["max_iterations"] == 3
+        # Config is now an openevolve Config object, not a plain dict.
+        assert config.max_iterations == 3
 
     def test_build_openevolve_config_no_override_keeps_yaml(self, config_file):
         """_build_openevolve_config without override uses YAML's max_iterations."""
@@ -479,7 +480,8 @@ class TestEvolutionRunner:
 
         runner = EvolutionRunner(config_file)
         config = runner._build_openevolve_config(n_generations=None)
-        assert config["evolution"]["max_iterations"] == 5
+        # Config is now an openevolve Config object, not a plain dict.
+        assert config.max_iterations == 5
 
 
 # ══════════════════════════════════════════════════════════════════════════════

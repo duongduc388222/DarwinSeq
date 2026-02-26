@@ -94,43 +94,48 @@ class EvolutionRunner:
         """
         Run the full evolution loop via OpenEvolve and return per-generation results.
 
-        Overrides max_iterations in the config if n_generations is given.  After
-        OpenEvolve finishes, loads checkpoint files to reconstruct per-generation
-        results and calls log_generation for each one.
+        Uses openevolve.run_evolution() with the DarwinSeq evaluator adapter.
+        Calls log_generation for each GenerationResult after the run completes.
 
         Args:
             n_generations: Number of generations to run.  If None, uses the value
                            from config['evolution']['max_iterations'].
 
         Returns:
-            List of GenerationResult, one per generation, ordered by generation_id.
+            List of GenerationResult, one per generation (or one for the whole
+            run if per-generation checkpoints are not available).
         """
-        from openevolve import Evolver  # imported here to allow tests without openevolve
+        from openevolve import run_evolution  # imported here to allow tests without openevolve
 
-        config = self._build_openevolve_config(n_generations)
+        oe_config = self._build_openevolve_config(n_generations)
+        n_iters = oe_config.max_iterations
+
+        project_root = Path(__file__).parent.parent
+        paths = self._config.get("paths", {})
+        program_file = str(
+            project_root / paths.get("program_file", "src/gene_selector_template.py")
+        )
+        evaluator_file = str(Path(__file__).parent / "openevolve_adapter.py")
+
         logger.info(
-            "Starting evolution: %d generations × pop=%d",
-            config["evolution"]["max_iterations"],
-            config["evolution"]["population_size"],
+            "Starting evolution: %d iterations, program=%s", n_iters, program_file
         )
 
-        evolver = Evolver(config)
-        evolver.run()
+        oe_result = run_evolution(
+            initial_program=program_file,
+            evaluator=evaluator_file,
+            config=oe_config,
+            iterations=n_iters,
+            output_dir=str(self._output_dir),
+            cleanup=False,
+        )
 
-        results = self._collect_results(evolver, config)
+        results = self._collect_results(oe_result)
         for gen_result in results:
             self.log_generation(gen_result.generation_id, gen_result)
 
-        logger.info(
-            "Evolution complete. Best score: %.4f (gen %d)",
-            max((r.best_score for r in results), default=float("nan")),
-            max(
-                (r.generation_id for r in results if r.best_score == max(
-                    (x.best_score for x in results), default=float("nan")
-                )),
-                default=-1,
-            ),
-        )
+        best_score = max((r.best_score for r in results), default=float("nan"))
+        logger.info("Evolution complete. Best score: %.4f", best_score)
         return results
 
     def log_generation(self, gen_id: int, result: GenerationResult) -> None:
@@ -180,85 +185,111 @@ class EvolutionRunner:
     # Private helpers
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _build_openevolve_config(self, n_generations: int | None) -> dict:
+    def _build_openevolve_config(self, n_generations: int | None):
         """
-        Build the OpenEvolve config dict from the loaded YAML.
+        Build an openevolve Config object from the loaded YAML.
 
-        Overrides max_iterations if n_generations is provided.  Resolves the
-        program_file and evaluator paths to absolute paths so OpenEvolve can
-        locate them regardless of working directory.
+        Translates our evolve_config.yaml structure into the openevolve v0.2.26+
+        Config dataclass, expanding any ${VAR} environment variable placeholders.
 
         Args:
             n_generations: Optional override for max_iterations.
 
         Returns:
-            Config dict ready to pass to openevolve.Evolver.
+            openevolve.config.Config instance ready to pass to run_evolution().
         """
-        config = _deep_copy_dict(self._config)
+        from openevolve.config import Config, LLMModelConfig
 
-        if n_generations is not None:
-            config.setdefault("evolution", {})["max_iterations"] = n_generations
+        cfg = self._config
+        evo = cfg.get("evolution", {})
+        llm_cfg = cfg.get("llm", {})
 
-        # Resolve file paths relative to project root (parent of config/).
-        project_root = Path(__file__).parent.parent
-        paths = config.get("paths", {})
-        for key in ("program_file", "output_dir", "checkpoint_dir"):
-            if key in paths and not Path(paths[key]).is_absolute():
-                paths[key] = str(project_root / paths[key])
+        config = Config()
+
+        # Evolution settings
+        config.max_iterations = n_generations if n_generations is not None else evo.get(
+            "max_iterations", 5
+        )
+        config.checkpoint_interval = evo.get("checkpoint_interval", 1)
+        if evo.get("random_seed") is not None:
+            config.random_seed = evo["random_seed"]
+            config.database.random_seed = evo["random_seed"]
+
+        # LLM model — expand ${VAR} placeholders using os.environ
+        api_key = _resolve_env_var(str(llm_cfg.get("api_key", "")))
+        model = LLMModelConfig(
+            name=llm_cfg.get("primary_model", "gpt-4"),
+            api_base=llm_cfg.get("api_base"),
+            api_key=api_key or None,
+            weight=float(llm_cfg.get("primary_weight", 1.0)),
+            temperature=float(llm_cfg.get("temperature", 0.7)),
+            max_tokens=int(llm_cfg.get("max_tokens", 4096)),
+        )
+        config.llm.models = [model]
+
+        # Population / database settings
+        config.database.population_size = evo.get("population_size", 5)
+        config.database.archive_size = evo.get("archive_size", 3)
+        config.database.num_islands = evo.get("num_islands", 1)
+
+        # System message (inline in YAML under 'system_message' key)
+        if cfg.get("system_message"):
+            config.prompt.system_message = cfg["system_message"]
 
         return config
 
-    def _collect_results(self, evolver, config: dict) -> list[GenerationResult]:
+    def _collect_results(self, oe_result) -> list[GenerationResult]:
         """
-        Collect per-generation results from OpenEvolve's checkpoint directory.
+        Build a GenerationResult list from an openevolve EvolutionResult.
 
-        Reads checkpoint JSON files written by OpenEvolve during evolution and
-        converts them to GenerationResult objects.  Falls back to a single
-        result from the best individual if no checkpoints are found.
+        Parses any per-generation checkpoint files written to the output_dir.
+        Falls back to a single result from oe_result.best_program if no
+        checkpoints are found.
 
         Args:
-            evolver: Completed openevolve.Evolver instance.
-            config: The config dict that was used to run evolution.
+            oe_result: openevolve.api.EvolutionResult from run_evolution().
 
         Returns:
             List of GenerationResult ordered by generation_id.
         """
-        checkpoint_dir = Path(
-            config.get("paths", {}).get("checkpoint_dir", "results/checkpoints")
-        )
-
         results: list[GenerationResult] = []
 
-        if checkpoint_dir.exists():
-            checkpoint_files = sorted(checkpoint_dir.glob("checkpoint_*.json"))
-            for i, ckpt_file in enumerate(checkpoint_files):
-                try:
-                    gen_result = _parse_checkpoint(i, ckpt_file)
-                    results.append(gen_result)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Failed to parse checkpoint %s: %s", ckpt_file, exc)
+        # Try per-generation checkpoint files first.
+        checkpoint_files = sorted(self._output_dir.glob("checkpoint_gen_*.json"))
+        if not checkpoint_files:
+            # OpenEvolve may use a different naming pattern.
+            checkpoint_files = sorted(self._output_dir.glob("checkpoint_*.json"))
 
-        # If no checkpoints were found, synthesize a single result from the best
-        # individual returned by the evolver.
-        if not results:
+        for i, ckpt_file in enumerate(checkpoint_files):
             try:
-                best = evolver.get_best_individual()
-                best_artifacts = getattr(best, "artifacts", {}) or {}
-                raw_coefs = best_artifacts.get("coefficients", {})
-                coefs = {k: float(v) for k, v in raw_coefs.items()} if isinstance(raw_coefs, dict) else {}
-                results.append(
-                    GenerationResult(
-                        generation_id=0,
-                        best_score=float(getattr(best, "fitness", 0.0)),
-                        best_genes=list(best_artifacts.get("selected_genes", [])),
-                        retained_genes=list(best_artifacts.get("retained_genes", [])),
-                        coefficients=coefs,
-                        all_scores=[float(getattr(best, "fitness", 0.0))],
-                        timestamp=_utc_now(),
-                    )
-                )
+                gen_result = _parse_checkpoint(i, ckpt_file)
+                results.append(gen_result)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Could not retrieve best individual: %s", exc)
+                logger.warning("Failed to parse checkpoint %s: %s", ckpt_file, exc)
+
+        if not results and oe_result is not None:
+            # Fall back: build one result from the best program.
+            best_prog = getattr(oe_result, "best_program", None)
+            artifacts = {}
+            if best_prog is not None:
+                artifacts = getattr(best_prog, "artifacts", {}) or {}
+            raw_coefs = artifacts.get("coefficients", {})
+            coefs = (
+                {k: float(v) for k, v in raw_coefs.items()}
+                if isinstance(raw_coefs, dict)
+                else {}
+            )
+            results.append(
+                GenerationResult(
+                    generation_id=0,
+                    best_score=float(getattr(oe_result, "best_score", 0.0)),
+                    best_genes=list(artifacts.get("selected_genes", [])),
+                    retained_genes=list(artifacts.get("retained_genes", [])),
+                    coefficients=coefs,
+                    all_scores=[float(getattr(oe_result, "best_score", 0.0))],
+                    timestamp=_utc_now(),
+                )
+            )
 
         return results
 
@@ -268,17 +299,24 @@ class EvolutionRunner:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def _deep_copy_dict(d: dict) -> dict:
+def _resolve_env_var(value: str) -> str:
     """
-    Return a deep copy of a plain dict/list/scalar structure via JSON round-trip.
+    Expand ``${VAR}`` placeholders in a string using os.environ.
 
     Args:
-        d: Dictionary to copy (must be JSON-serializable).
+        value: String possibly containing ``${VAR_NAME}`` patterns.
 
     Returns:
-        Deep copy of d.
+        String with placeholders replaced by their environment variable values.
+        Unresolved placeholders are left unchanged.
     """
-    return json.loads(json.dumps(d))
+    import re
+
+    return re.sub(
+        r"\$\{([^}]+)\}",
+        lambda m: os.environ.get(m.group(1), m.group(0)),
+        value,
+    )
 
 
 def _utc_now() -> str:

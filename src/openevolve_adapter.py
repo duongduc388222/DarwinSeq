@@ -2,18 +2,18 @@
 openevolve_adapter.py — Adapter connecting DarwinSeq's pipeline to OpenEvolve's
 evaluator interface.
 
-OpenEvolve calls GeneSelectorEvaluator.evaluate_stage1(select_genes_func) each
-generation with the evolved function.  The adapter:
-  1. Calls select_genes_func(gene_vocabulary, all_genes) → 200 genes
-  2. Validates the output (count, uniqueness, presence in dataset)
-  3. Samples 100 cells and runs the ADNC classification evaluator
-  4. Returns EvaluationResult with fitness (balanced accuracy) and LLM
-     feedback artifacts
+OpenEvolve v0.2.26+ imports this file and calls the module-level
+``evaluate_stage1(program_path)`` function each generation.  The function:
+  1. Loads ``select_genes`` from the evolved program file
+  2. Delegates to GeneSelectorEvaluator.evaluate_stage1(select_genes_func)
+  3. Returns EvaluationResult with fitness (balanced accuracy) and LLM artifacts
 
-The DataLoader and other heavy objects are loaded lazily on the first call so
-that tests can instantiate GeneSelectorEvaluator without a real h5ad file.
+GeneSelectorEvaluator is also useful for unit tests (pass the function directly).
+Heavy objects (DataLoader, GeneVocabulary, ADNCEvaluator) are loaded lazily on
+the first call so tests can instantiate the class without a real h5ad file.
 """
 
+import importlib.util
 import logging
 import sys
 import traceback
@@ -33,6 +33,70 @@ from src.gene_vocab import DEFAULT_VOCAB_PATH, GeneVocabulary
 from src.sampler import CellSampler
 
 logger = logging.getLogger(__name__)
+
+# ── Module-level singleton used by the evaluate_stage1 entry point ────────────
+# OpenEvolve imports this file once per process and calls evaluate_stage1
+# for each evolved program.  A singleton avoids reloading the h5ad file.
+_singleton_evaluator: "GeneSelectorEvaluator | None" = None
+
+
+def _get_singleton_evaluator() -> "GeneSelectorEvaluator":
+    """
+    Return the module-level GeneSelectorEvaluator singleton, creating it on first call.
+
+    Returns:
+        Shared GeneSelectorEvaluator instance.
+    """
+    global _singleton_evaluator
+    if _singleton_evaluator is None:
+        _singleton_evaluator = GeneSelectorEvaluator()
+    return _singleton_evaluator
+
+
+def evaluate_stage1(program_path: str) -> EvaluationResult:
+    """
+    Module-level entry point called by OpenEvolve for each evolved program.
+
+    OpenEvolve writes the evolved program to a temp file and calls this function
+    with its path.  We load ``select_genes`` from that file and pass it to the
+    GeneSelectorEvaluator pipeline.
+
+    Args:
+        program_path: Absolute path to the evolved Python program file.
+
+    Returns:
+        EvaluationResult with:
+            metrics = {'primary': balanced_accuracy, 'balanced_accuracy': float, ...}
+            artifacts = {'retained_genes': [...], 'coefficients': {...}, ...}
+    """
+    try:
+        spec = importlib.util.spec_from_file_location("_evolved_program", program_path)
+        if spec is None or spec.loader is None:
+            return EvaluationResult(
+                metrics={"primary": 0.0},
+                artifacts={"error": True, "error_message": f"Cannot load: {program_path}"},
+            )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        if not hasattr(module, "select_genes"):
+            return EvaluationResult(
+                metrics={"primary": 0.0},
+                artifacts={
+                    "error": True,
+                    "error_message": "select_genes function not found in evolved program",
+                },
+            )
+
+        return _get_singleton_evaluator().evaluate_stage1(module.select_genes)
+
+    except Exception as exc:
+        err_msg = f"evaluate_stage1 failed loading {program_path}: {exc}\n{traceback.format_exc()}"
+        logger.error(err_msg)
+        return EvaluationResult(
+            metrics={"primary": 0.0},
+            artifacts={"error": True, "error_message": err_msg},
+        )
 
 # Default number of cells to sample per evaluation run.
 DEFAULT_N_CELLS = 100
