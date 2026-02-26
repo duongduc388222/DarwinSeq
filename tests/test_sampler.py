@@ -63,6 +63,8 @@ class FakeDataLoader:
             columns=_PATHOLOGY_COLS,
         )
         obs["Donor ID"] = donors
+        # ADNC labels: cycle through 4 classes (0–3) deterministically.
+        obs["ADNC"] = [float(i % 4) for i in range(n_cells)]
 
         self.adata = _FakeAdata(obs)
 
@@ -81,6 +83,23 @@ class FakeDataLoader:
         return pd.DataFrame(
             expr.astype(np.float32), index=cell_barcodes, columns=gene_list
         )
+
+    def get_adnc_target(
+        self, cell_barcodes: list[str] | None = None
+    ) -> pd.Series:
+        """
+        Return ADNC integer-encoded labels for requested barcodes.
+
+        Args:
+            cell_barcodes: List of barcode strings to look up, or None for all.
+
+        Returns:
+            pd.Series named "ADNC" with float values 0.0–3.0.
+        """
+        series = self.adata.obs["ADNC"]
+        if cell_barcodes is not None:
+            return series.loc[cell_barcodes].copy()
+        return series.copy()
 
     def get_pathology_targets(
         self, cell_barcodes: list[str] | None = None
@@ -122,10 +141,11 @@ def test_sample_x_shape(loader, gene_list):
 
 
 def test_sample_y_shape(loader, gene_list):
-    """y should be (100, 6)."""
+    """y (adnc mode) should be (100, 1) with column 'ADNC'."""
     sampler = CellSampler(loader, gene_list, seed=42)
     _, y = sampler.sample(n=100)
-    assert y.shape == (100, 6)
+    assert y.shape == (100, 1)
+    assert list(y.columns) == ["ADNC"]
 
 
 def test_sample_x_columns_match_gene_list(loader, gene_list):
@@ -136,8 +156,8 @@ def test_sample_x_columns_match_gene_list(loader, gene_list):
 
 
 def test_sample_y_columns_are_pathology_targets(loader, gene_list):
-    """y columns must be the pathology target names."""
-    sampler = CellSampler(loader, gene_list, seed=42)
+    """y columns must be the pathology target names (legacy pathology mode)."""
+    sampler = CellSampler(loader, gene_list, seed=42, target="pathology")
     _, y = sampler.sample(n=100)
     assert list(y.columns) == _PATHOLOGY_COLS
 
@@ -193,8 +213,8 @@ def test_expression_values_match_stub(loader, gene_list):
 
 
 def test_pathology_targets_match_obs(loader, gene_list):
-    """y values should match the pathology columns in data_loader.adata.obs."""
-    sampler = CellSampler(loader, gene_list, seed=7)
+    """y values (pathology mode) should match pathology obs columns."""
+    sampler = CellSampler(loader, gene_list, seed=7, target="pathology")
     _, y = sampler.sample(n=10)
 
     barcodes = list(y.index)
@@ -250,7 +270,7 @@ def test_small_n_works(loader, gene_list):
     sampler = CellSampler(loader, gene_list, seed=0)
     X, y = sampler.sample(n=1)
     assert X.shape == (1, 200)
-    assert y.shape == (1, 6)
+    assert y.shape == (1, 1)  # adnc mode: single 'ADNC' column
 
 
 def test_n_equals_all_cells(loader, gene_list):

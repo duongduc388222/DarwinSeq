@@ -49,6 +49,10 @@ _PATHOLOGY_COLS = [
     "percent aSyn positive area",
 ]
 
+# ADNC target column and ordinal label order (index = integer code).
+_ADNC_COL = "ADNC"
+ADNC_LABEL_ORDER: list[str] = ["Not AD", "Low", "Intermediate", "High"]
+
 # Metadata columns that must not be NaN for a sample to be usable.
 _REQUIRED_META_COLS = ["Donor ID"]
 
@@ -477,3 +481,60 @@ class DataLoader:
                 raise KeyError(f"Barcode(s) not found in adata: {missing[:5]}")
             return self.adata.obs.loc[cell_barcodes].copy()
         return self.adata.obs.copy()
+
+    def get_adnc_target(
+        self,
+        cell_barcodes: list[str] | None = None,
+    ) -> "pd.Series":
+        """
+        Return ordinal-encoded ADNC labels as a float Series (NaN-safe).
+
+        Encodes: Not AD=0, Low=1, Intermediate=2, High=3.
+        Handles both string labels (most common) and already-integer codes.
+        Cells where ADNC is NaN are returned as NaN (not dropped).
+
+        Args:
+            cell_barcodes: If provided, return only rows for these barcodes.
+                           If None, return all cells.
+
+        Returns:
+            pd.Series named "ADNC" with float values (0.0–3.0 or NaN).
+
+        Raises:
+            KeyError: If the ADNC column is absent, or if any barcode is
+                      not found in adata.
+            ValueError: If an unknown string label is encountered.
+        """
+        if _ADNC_COL not in self.adata.obs.columns:
+            raise KeyError(
+                f"Column '{_ADNC_COL}' not found in adata.obs. "
+                f"Available columns: {list(self.adata.obs.columns[:10])}"
+            )
+
+        if cell_barcodes is not None:
+            missing = [bc for bc in cell_barcodes if bc not in self.adata.obs.index]
+            if missing:
+                raise KeyError(f"Barcode(s) not found in adata: {missing[:5]}")
+            raw = self.adata.obs.loc[cell_barcodes, _ADNC_COL]
+        else:
+            raw = self.adata.obs[_ADNC_COL]
+
+        # Already numeric — return as float directly.
+        if pd.api.types.is_numeric_dtype(raw):
+            return raw.astype(float).rename("ADNC")
+
+        # Map string labels to integer codes.
+        label_to_int = {label: float(i) for i, label in enumerate(ADNC_LABEL_ORDER)}
+
+        def _encode(val: object) -> float:
+            if pd.isna(val):
+                return float("nan")
+            key = str(val)
+            if key not in label_to_int:
+                raise ValueError(
+                    f"Unknown ADNC label: '{key}'. "
+                    f"Expected one of {ADNC_LABEL_ORDER}."
+                )
+            return label_to_int[key]
+
+        return raw.map(_encode).rename("ADNC")

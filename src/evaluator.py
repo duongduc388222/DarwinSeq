@@ -1,14 +1,15 @@
 """
-evaluator.py — Fixed-parameter LASSO evaluator for the SEA-AD DREAM Challenge.
+evaluator.py — ADNC classification evaluator for the SEA-AD DREAM Challenge.
 
-Trains one Lasso regression model per pathology target on gene-expression data,
-scores predictions using Pearson correlation, and returns which genes carry
-non-zero coefficients.
+Trains a single L1-penalised logistic regression model on gene-expression data
+to predict ADNC class (Not AD=0 / Low=1 / Intermediate=2 / High=3), scores
+predictions using balanced accuracy, and returns which genes carry non-zero
+coefficients across the one-vs-rest (OvR) binary classifiers.
 
 Usage example:
-    evaluator = LASSOEvaluator()
+    evaluator = ADNCEvaluator()
     result = evaluator.evaluate(X, y)
-    print(result.aggregate_score, result.retained_genes)
+    print(result.balanced_accuracy, result.retained_genes)
 """
 
 import json
@@ -18,63 +19,70 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.stats import pearsonr
-from sklearn.linear_model import Lasso
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import balanced_accuracy_score, f1_score
 from sklearn.preprocessing import StandardScaler
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_PATH = str(
-    Path(__file__).parent.parent / "config" / "lasso_params.json"
+    Path(__file__).parent.parent / "config" / "model_params.json"
 )
 
 
 @dataclass
 class EvalResult:
     """
-    Output of a single LASSOEvaluator.evaluate() call.
+    Output of a single ADNCEvaluator.evaluate() call.
 
     Attributes:
-        scores: Per-target Pearson r values keyed by target column name.
-                Targets skipped due to all-NaN y are absent from this dict.
-        aggregate_score: Mean Pearson r across all evaluated targets.
-        retained_genes: Sorted list of genes with |coef| > coef_threshold
-                        in at least one target model (union across targets).
-        coefficients: Gene → mean absolute coefficient across all target models
-                      in which the gene appeared. Covers all retained_genes.
+        balanced_accuracy: Primary metric — sklearn balanced_accuracy_score
+                           on the training set.
+        macro_f1: Macro-averaged F1 across all ADNC classes seen in the sample.
+        aggregate_score: Alias for balanced_accuracy. Kept so the OpenEvolve
+                         adapter and run_baseline.py can use a stable key.
+        retained_genes: Sorted list of genes whose sum-of-|coef| across all
+                        OvR classifiers exceeds coef_threshold.
+        coefficients: Gene → sum of |coef| across classes. Covers all
+                      retained_genes.
         n_retained: len(retained_genes).
+        per_class_f1: Class label (str) → per-class F1 score.
     """
 
-    scores: dict = field(default_factory=dict)
+    balanced_accuracy: float = 0.0
+    macro_f1: float = 0.0
     aggregate_score: float = 0.0
     retained_genes: list = field(default_factory=list)
     coefficients: dict = field(default_factory=dict)
     n_retained: int = 0
+    per_class_f1: dict = field(default_factory=dict)
 
 
-class LASSOEvaluator:
+class ADNCEvaluator:
     """
-    LASSO-based evaluator for gene-expression → pathology-target prediction.
+    L1 logistic regression evaluator for ADNC 4-class prediction.
 
-    Fits one sklearn Lasso per pathology target using fixed hyperparameters
-    loaded from a JSON config file. Features are StandardScaler-normalised
-    before fitting. Pearson correlation is computed on the training set (the
-    same data used for fitting) to produce a signal for evolutionary search.
+    Fits a single LogisticRegression(penalty='l1', solver='liblinear') on
+    gene-expression features to predict ADNC class. StandardScaler
+    normalisation is applied before fitting. Balanced accuracy is the primary
+    fitness signal returned to the gene-selection loop.
 
     Args:
-        config_path: Path to the JSON file with LASSO hyperparameters.
+        config_path: Path to the JSON config file (model_params.json).
                      Defaults to DEFAULT_CONFIG_PATH.
     """
 
     def __init__(self, config_path: str = DEFAULT_CONFIG_PATH) -> None:
         config_path = str(config_path)
         if not Path(config_path).exists():
-            raise FileNotFoundError(f"LASSO config not found: {config_path}")
+            raise FileNotFoundError(f"Model config not found: {config_path}")
         with open(config_path) as fh:
             self._params = json.load(fh)
 
-        self._alpha: float = float(self._params["alpha"])
-        self._fit_intercept: bool = bool(self._params["fit_intercept"])
+        self._C: float = float(self._params["C"])
+        self._penalty: str = str(self._params["penalty"])
+        self._solver: str = str(self._params["solver"])
+        self._class_weight = self._params["class_weight"]
         self._max_iter: int = int(self._params["max_iter"])
         self._random_state: int = int(self._params["random_state"])
         self._coef_threshold: float = float(self._params["coef_threshold"])
@@ -85,22 +93,20 @@ class LASSOEvaluator:
 
     def evaluate(self, X: pd.DataFrame, y: pd.DataFrame) -> EvalResult:
         """
-        Train LASSO on X and y, score predictions, and return retained genes.
+        Train L1 logistic regression on X predicting ADNC class in y.
 
-        Fits one Lasso per column in y. Each model is trained on the subset of
-        rows where y_target is not NaN. Pearson r is computed on the same
-        training rows. Retained genes are the union of non-zero coefficient
-        genes across all fitted models.
+        y must have a single column (named "ADNC" by convention) containing
+        integer-encoded ADNC labels (0=Not AD, 1=Low, 2=Intermediate, 3=High).
+        Rows where y is NaN are silently dropped before fitting.
 
         Args:
-            X: Feature matrix, shape (n_samples, n_genes). Index must align
+            X: Feature matrix, shape (n_cells, n_genes). Index must align
                with y's index.
-            y: Target matrix, shape (n_samples, n_targets). Columns are
-               pathology target names.
+            y: Single-column DataFrame with ADNC integer labels (or NaN).
 
         Returns:
-            EvalResult with per-target scores, aggregate score, retained
-            genes, and coefficient magnitudes.
+            EvalResult with balanced_accuracy, macro_f1, retained_genes,
+            coefficients, per_class_f1, and n_retained.
 
         Raises:
             ValueError: If X and y have different numbers of rows.
@@ -113,56 +119,43 @@ class LASSOEvaluator:
         if X.empty or y.empty:
             return EvalResult()
 
+        # Drop NaN-labelled rows.
+        target_col = y.columns[0]
+        y_col = y[target_col]
+        valid_mask = y_col.notna()
+        n_valid = int(valid_mask.sum())
+
+        if n_valid < 10:
+            logger.warning(
+                "Fewer than 10 labelled cells (%d); returning zero result.", n_valid
+            )
+            return EvalResult()
+
+        y_labels = y_col[valid_mask].values.astype(int)
+
+        if len(np.unique(y_labels)) < 2:
+            logger.warning(
+                "Only one ADNC class present in sample; returning zero result."
+            )
+            return EvalResult()
+
         gene_names = list(X.columns)
         X_scaled, _ = self._preprocess(X, y)
+        X_fit = X_scaled[valid_mask.values]
 
-        all_scores: dict[str, float] = {}
-        # gene → list of abs coef values across targets
-        gene_coef_accum: dict[str, list[float]] = {}
+        bal_acc, macro_f1, coef_dict, per_class_f1 = self._train_and_score(
+            X_fit, y_labels, gene_names
+        )
 
-        for target_col in y.columns:
-            y_target = y[target_col]
-            valid_mask = y_target.notna()
-            n_valid = valid_mask.sum()
-
-            if n_valid == 0:
-                logger.warning("Target '%s' has no non-NaN values; skipping.", target_col)
-                continue
-            if n_valid < 2:
-                logger.warning(
-                    "Target '%s' has only %d non-NaN sample(s); skipping.",
-                    target_col, n_valid,
-                )
-                continue
-
-            X_fit = X_scaled[valid_mask.values]
-            y_fit = y_target[valid_mask].values.astype(float)
-
-            r, coef_dict = self._train_and_score(X_fit, y_fit, gene_names)
-            all_scores[target_col] = r
-
-            for gene, coef_abs in coef_dict.items():
-                gene_coef_accum.setdefault(gene, []).append(coef_abs)
-
-        # Aggregate score: mean Pearson r across all evaluated targets.
-        if all_scores:
-            aggregate = float(np.mean(list(all_scores.values())))
-        else:
-            aggregate = 0.0
-
-        # Retained genes: union of non-zero-coef genes, sorted for determinism.
-        retained_genes = sorted(gene_coef_accum.keys())
-        coefficients = {
-            gene: float(np.mean(vals))
-            for gene, vals in gene_coef_accum.items()
-        }
-
+        retained_genes = sorted(coef_dict.keys())
         return EvalResult(
-            scores=all_scores,
-            aggregate_score=aggregate,
+            balanced_accuracy=bal_acc,
+            macro_f1=macro_f1,
+            aggregate_score=bal_acc,
             retained_genes=retained_genes,
-            coefficients=coefficients,
+            coefficients=coef_dict,
             n_retained=len(retained_genes),
+            per_class_f1=per_class_f1,
         )
 
     # ------------------------------------------------------------------
@@ -177,13 +170,12 @@ class LASSOEvaluator:
         """
         Scale feature matrix X with StandardScaler.
 
-        Fit the scaler on all rows of X (NaN handling in y is done
-        per-target inside evaluate()). The scaler is re-fit fresh for
-        each evaluate() call so results are reproducible given the same X.
+        The scaler is re-fit from scratch on each evaluate() call so results
+        are fully reproducible given the same X, regardless of call order.
 
         Args:
-            X: Feature matrix (n_samples, n_genes).
-            y: Target matrix (passed through unchanged).
+            X: Feature matrix (n_cells, n_genes).
+            y: Target DataFrame (passed through unchanged).
 
         Returns:
             Tuple of (X_scaled as np.ndarray, y unchanged as pd.DataFrame).
@@ -195,43 +187,55 @@ class LASSOEvaluator:
     def _train_and_score(
         self,
         X_scaled: np.ndarray,
-        y_target: np.ndarray,
+        y_labels: np.ndarray,
         gene_names: list[str],
-    ) -> tuple[float, dict[str, float]]:
+    ) -> tuple[float, float, dict[str, float], dict[str, float]]:
         """
-        Fit a single Lasso model and return Pearson r + non-zero coef genes.
+        Fit a single L1 logistic regression model and return classification
+        metrics plus gene importance coefficients.
 
         Args:
-            X_scaled: Scaled feature matrix (n_samples, n_genes).
-            y_target: 1-D target array (n_samples,), no NaNs.
+            X_scaled: Scaled feature matrix (n_valid_cells, n_genes).
+            y_labels: 1-D integer label array (n_valid_cells,), no NaNs.
             gene_names: Gene names matching columns of X_scaled.
 
         Returns:
             Tuple of:
-              - pearson_r: float, Pearson correlation between y_target and
-                           in-sample predictions. NaN if variance is zero.
-              - coef_dict: {gene: abs(coef)} for genes with |coef| > threshold.
+              - balanced_accuracy: float, in-sample balanced accuracy.
+              - macro_f1: float, macro-averaged F1.
+              - coef_dict: {gene: sum_abs_coef} for genes above threshold.
+              - per_class_f1: {class_label_str: f1_score} for each class.
         """
-        model = Lasso(
-            alpha=self._alpha,
-            fit_intercept=self._fit_intercept,
+        model = LogisticRegression(
+            penalty=self._penalty,
+            solver=self._solver,
+            C=self._C,
+            class_weight=self._class_weight,
             max_iter=self._max_iter,
+            random_state=self._random_state,
         )
-        model.fit(X_scaled, y_target)
-
+        model.fit(X_scaled, y_labels)
         y_pred = model.predict(X_scaled)
 
-        # Pearson r: returns NaN if either array has zero variance.
-        if np.std(y_target) == 0 or np.std(y_pred) == 0:
-            r = float("nan")
-        else:
-            r, _ = pearsonr(y_target, y_pred)
-            r = float(r)
+        bal_acc = float(balanced_accuracy_score(y_labels, y_pred))
+        macro_f1 = float(
+            f1_score(y_labels, y_pred, average="macro", zero_division=0)
+        )
+        per_class_scores = f1_score(
+            y_labels, y_pred, average=None, zero_division=0
+        )
+        per_class_f1 = {
+            str(cls): float(score)
+            for cls, score in zip(model.classes_, per_class_scores)
+        }
 
-        # Extract non-zero coefficients.
-        coef_dict: dict[str, float] = {}
-        for gene, coef in zip(gene_names, model.coef_):
-            if abs(coef) > self._coef_threshold:
-                coef_dict[gene] = abs(float(coef))
+        # Gene importance: sum |coef| across all OvR binary classifiers.
+        # model.coef_ has shape (n_classes, n_genes).
+        importance = np.sum(np.abs(model.coef_), axis=0)
+        coef_dict: dict[str, float] = {
+            gene: float(importance[i])
+            for i, gene in enumerate(gene_names)
+            if importance[i] > self._coef_threshold
+        }
 
-        return r, coef_dict
+        return bal_acc, macro_f1, coef_dict, per_class_f1

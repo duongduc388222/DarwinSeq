@@ -11,7 +11,7 @@ Usage:
 Output files:
     <output_dir>/all_runs.json     — per-seed results (list of dicts)
     <output_dir>/summary.json      — aggregate statistics across all seeds
-    <output_dir>/best_run.json     — run with the highest aggregate_score
+    <output_dir>/best_run.json     — run with the highest balanced accuracy
 """
 
 import argparse
@@ -25,8 +25,8 @@ import numpy as np
 # Allow running from project root without installing the package.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.data_loader import DataLoader, DEFAULT_DATA_PATH, safe_load
-from src.evaluator import LASSOEvaluator, DEFAULT_CONFIG_PATH
+from src.data_loader import DataLoader, DEFAULT_DATA_PATH
+from src.evaluator import ADNCEvaluator, DEFAULT_CONFIG_PATH
 from src.gene_vocab import GeneVocabulary, DEFAULT_VOCAB_PATH
 from src.sampler import CellSampler
 
@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 def run_single_seed(
     data_loader,
     vocab: GeneVocabulary,
-    evaluator: LASSOEvaluator,
+    evaluator: ADNCEvaluator,
     seed: int,
     n_in: int = 100,
     n_out: int = 100,
@@ -56,12 +56,13 @@ def run_single_seed(
     Run one full pipeline iteration for a given random seed.
 
     Samples n_in + n_out genes randomly, then samples n_cells cells, then
-    evaluates LASSO performance. All randomness is controlled by seed.
+    evaluates ADNC classification performance. All randomness is controlled
+    by seed.
 
     Args:
         data_loader: DataLoader instance (or compatible stub for testing).
         vocab: GeneVocabulary instance with in_vocab and out_vocab populated.
-        evaluator: LASSOEvaluator instance.
+        evaluator: ADNCEvaluator instance.
         seed: Integer random seed controlling gene sampling and cell sampling.
         n_in: Number of in-vocab genes to sample.
         n_out: Number of out-of-vocab genes to sample.
@@ -71,20 +72,24 @@ def run_single_seed(
         Dict with keys:
           - seed (int)
           - gene_list (list[str]): the n_in + n_out genes used
-          - scores (dict[str, float]): per-target Pearson r
-          - aggregate_score (float): mean Pearson r across targets
-          - retained_genes (list[str]): genes with non-zero LASSO coefficient
+          - balanced_accuracy (float): primary ADNC classification metric
+          - macro_f1 (float): macro-averaged F1 across ADNC classes
+          - per_class_f1 (dict[str, float]): per-class F1 scores
+          - aggregate_score (float): alias for balanced_accuracy
+          - retained_genes (list[str]): genes with non-zero logistic coef
           - n_retained (int): len(retained_genes)
     """
     gene_list = vocab.sample_subset(n_in=n_in, n_out=n_out, seed=seed)
-    sampler = CellSampler(data_loader, gene_list, seed=seed)
+    sampler = CellSampler(data_loader, gene_list, seed=seed, target="adnc")
     X, y = sampler.sample(n=n_cells)
     result = evaluator.evaluate(X, y)
 
     return {
         "seed": seed,
         "gene_list": gene_list,
-        "scores": result.scores,
+        "balanced_accuracy": result.balanced_accuracy,
+        "macro_f1": result.macro_f1,
+        "per_class_f1": result.per_class_f1,
         "aggregate_score": result.aggregate_score,
         "retained_genes": result.retained_genes,
         "n_retained": result.n_retained,
@@ -101,26 +106,26 @@ def compute_summary(all_runs: list[dict]) -> dict:
     Returns:
         Dict with keys:
           - n_runs (int): number of runs
-          - aggregate_score_mean (float)
-          - aggregate_score_std (float)
-          - aggregate_score_min (float)
-          - aggregate_score_max (float)
+          - balanced_accuracy_mean / _std / _min / _max (float)
+          - macro_f1_mean (float)
           - gene_frequency (dict[str, int]): gene → number of runs in which
-            it was retained (non-zero LASSO coefficient)
+            it was retained (non-zero logistic coefficient)
           - retained_count_distribution (list[int]): n_retained per run
     """
     if not all_runs:
         return {
             "n_runs": 0,
-            "aggregate_score_mean": float("nan"),
-            "aggregate_score_std": float("nan"),
-            "aggregate_score_min": float("nan"),
-            "aggregate_score_max": float("nan"),
+            "balanced_accuracy_mean": float("nan"),
+            "balanced_accuracy_std": float("nan"),
+            "balanced_accuracy_min": float("nan"),
+            "balanced_accuracy_max": float("nan"),
+            "macro_f1_mean": float("nan"),
             "gene_frequency": {},
             "retained_count_distribution": [],
         }
 
-    agg_scores = [r["aggregate_score"] for r in all_runs]
+    bal_accs = [r["balanced_accuracy"] for r in all_runs]
+    macro_f1s = [r["macro_f1"] for r in all_runs]
     gene_frequency: dict[str, int] = {}
     retained_dist: list[int] = []
 
@@ -131,10 +136,11 @@ def compute_summary(all_runs: list[dict]) -> dict:
 
     return {
         "n_runs": len(all_runs),
-        "aggregate_score_mean": float(np.mean(agg_scores)),
-        "aggregate_score_std": float(np.std(agg_scores)),
-        "aggregate_score_min": float(np.min(agg_scores)),
-        "aggregate_score_max": float(np.max(agg_scores)),
+        "balanced_accuracy_mean": float(np.mean(bal_accs)),
+        "balanced_accuracy_std": float(np.std(bal_accs)),
+        "balanced_accuracy_min": float(np.min(bal_accs)),
+        "balanced_accuracy_max": float(np.max(bal_accs)),
+        "macro_f1_mean": float(np.mean(macro_f1s)),
         "gene_frequency": gene_frequency,
         "retained_count_distribution": retained_dist,
     }
@@ -142,17 +148,18 @@ def compute_summary(all_runs: list[dict]) -> dict:
 
 def select_best_run(all_runs: list[dict]) -> dict | None:
     """
-    Return the run with the highest aggregate_score.
+    Return the run with the highest balanced_accuracy.
 
     Args:
         all_runs: List of dicts returned by run_single_seed().
 
     Returns:
-        The dict with the maximum aggregate_score, or None if all_runs is empty.
+        The dict with the maximum balanced_accuracy, or None if all_runs is
+        empty.
     """
     if not all_runs:
         return None
-    return max(all_runs, key=lambda r: r["aggregate_score"])
+    return max(all_runs, key=lambda r: r["balanced_accuracy"])
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +210,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--config_path", type=str, default=DEFAULT_CONFIG_PATH,
-        help="Path to the LASSO hyperparameter JSON config.",
+        help="Path to the model hyperparameter JSON config.",
     )
     return parser.parse_args(argv)
 
@@ -236,7 +243,7 @@ def main(argv=None) -> None:
         vocab_info["coverage_pct"],
     )
 
-    evaluator = LASSOEvaluator(config_path=args.config_path)
+    evaluator = ADNCEvaluator(config_path=args.config_path)
     logger.info(
         "Starting baseline: %d seeds × (%d in + %d out genes) × %d cells",
         args.n_seeds, args.n_in, args.n_out, args.n_cells,
@@ -255,9 +262,10 @@ def main(argv=None) -> None:
         )
         all_runs.append(result)
         logger.info(
-            "Seed %3d/%d  aggregate=%.4f  retained=%d",
+            "Seed %3d/%d  bal_acc=%.4f  f1=%.4f  retained=%d",
             i + 1, args.n_seeds,
-            result["aggregate_score"],
+            result["balanced_accuracy"],
+            result["macro_f1"],
             result["n_retained"],
         )
 
@@ -273,11 +281,12 @@ def main(argv=None) -> None:
     with open(summary_path, "w") as fh:
         json.dump(summary, fh, indent=2)
     logger.info(
-        "Summary: mean=%.4f ± %.4f  [%.4f, %.4f]",
-        summary["aggregate_score_mean"],
-        summary["aggregate_score_std"],
-        summary["aggregate_score_min"],
-        summary["aggregate_score_max"],
+        "Summary: bal_acc=%.4f ± %.4f  [%.4f, %.4f]  macro_f1=%.4f",
+        summary["balanced_accuracy_mean"],
+        summary["balanced_accuracy_std"],
+        summary["balanced_accuracy_min"],
+        summary["balanced_accuracy_max"],
+        summary["macro_f1_mean"],
     )
     logger.info("Saved summary → %s", summary_path)
 
@@ -288,8 +297,9 @@ def main(argv=None) -> None:
         with open(best_path, "w") as fh:
             json.dump(best, fh, indent=2)
         logger.info(
-            "Best run: seed=%d  aggregate=%.4f  retained=%d → %s",
-            best["seed"], best["aggregate_score"], best["n_retained"], best_path,
+            "Best run: seed=%d  bal_acc=%.4f  macro_f1=%.4f  retained=%d → %s",
+            best["seed"], best["balanced_accuracy"], best["macro_f1"],
+            best["n_retained"], best_path,
         )
 
 

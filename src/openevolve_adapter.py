@@ -6,8 +6,9 @@ OpenEvolve calls GeneSelectorEvaluator.evaluate_stage1(select_genes_func) each
 generation with the evolved function.  The adapter:
   1. Calls select_genes_func(gene_vocabulary, all_genes) → 200 genes
   2. Validates the output (count, uniqueness, presence in dataset)
-  3. Samples 100 cells and runs the LASSO evaluator
-  4. Returns EvaluationResult with fitness (Pearson r) and LLM feedback artifacts
+  3. Samples 100 cells and runs the ADNC classification evaluator
+  4. Returns EvaluationResult with fitness (balanced accuracy) and LLM
+     feedback artifacts
 
 The DataLoader and other heavy objects are loaded lazily on the first call so
 that tests can instantiate GeneSelectorEvaluator without a real h5ad file.
@@ -27,7 +28,7 @@ if _PROJECT_ROOT not in sys.path:
 from openevolve.evaluation_result import EvaluationResult
 
 from src.data_loader import DEFAULT_DATA_PATH, DataLoader
-from src.evaluator import DEFAULT_CONFIG_PATH, LASSOEvaluator
+from src.evaluator import DEFAULT_CONFIG_PATH, ADNCEvaluator
 from src.gene_vocab import DEFAULT_VOCAB_PATH, GeneVocabulary
 from src.sampler import CellSampler
 
@@ -47,7 +48,7 @@ class GeneSelectorEvaluator:
     Args:
         data_path: Path to the SEAAD A9 h5ad file. Defaults to DEFAULT_DATA_PATH.
         vocab_path: Path to the gene vocabulary text file. Defaults to DEFAULT_VOCAB_PATH.
-        config_path: Path to the LASSO JSON config. Defaults to DEFAULT_CONFIG_PATH.
+        config_path: Path to the model JSON config. Defaults to DEFAULT_CONFIG_PATH.
         n_cells: Number of cells to sample per evaluation. Default 100.
         sample_seed: Random seed for cell sampling. Default 42.
     """
@@ -69,7 +70,7 @@ class GeneSelectorEvaluator:
         # Lazily loaded on first evaluate call.
         self._data_loader: DataLoader | None = None
         self._vocab: GeneVocabulary | None = None
-        self._evaluator: LASSOEvaluator | None = None
+        self._evaluator: ADNCEvaluator | None = None
 
     # ──────────────────────────────────────────────────────────────────────────
     # Public API (OpenEvolve interface)
@@ -81,8 +82,8 @@ class GeneSelectorEvaluator:
 
         OpenEvolve calls this with the evolved select_genes function each
         generation.  Returns an EvaluationResult whose metrics['primary'] is
-        the aggregate LASSO Pearson r score and whose artifacts contain detailed
-        feedback for the LLM (retained genes, coefficients, suggestions).
+        the balanced accuracy for ADNC classification, and whose artifacts
+        contain detailed feedback for the LLM.
 
         Args:
             select_genes_func: The evolved callable with signature
@@ -92,9 +93,11 @@ class GeneSelectorEvaluator:
         Returns:
             EvaluationResult with:
                 metrics = {
-                    'primary': float,          # aggregate Pearson r (main fitness)
-                    'per_target_scores': dict, # per-target Pearson r values
-                    'n_retained': int,         # genes with non-zero LASSO coef
+                    'primary': float,           # balanced accuracy (main fitness)
+                    'balanced_accuracy': float,
+                    'macro_f1': float,
+                    'per_class_f1': dict,       # class label → F1
+                    'n_retained': int,          # genes with non-zero coef
                 }
                 artifacts = {
                     'retained_genes': list[str],
@@ -122,7 +125,8 @@ class GeneSelectorEvaluator:
 
             # ── Run pipeline ──────────────────────────────────────────────────
             sampler = CellSampler(
-                self._data_loader, selected_genes, seed=self._sample_seed
+                self._data_loader, selected_genes,
+                seed=self._sample_seed, target="adnc",
             )
             X, y = sampler.sample(self._n_cells)
             eval_result = self._evaluator.evaluate(X, y)
@@ -133,7 +137,9 @@ class GeneSelectorEvaluator:
             return EvaluationResult(
                 metrics={
                     "primary": eval_result.aggregate_score,
-                    "per_target_scores": eval_result.scores,
+                    "balanced_accuracy": eval_result.balanced_accuracy,
+                    "macro_f1": eval_result.macro_f1,
+                    "per_class_f1": eval_result.per_class_f1,
                     "n_retained": eval_result.n_retained,
                 },
                 artifacts={
@@ -170,7 +176,7 @@ class GeneSelectorEvaluator:
 
     def _ensure_loaded(self) -> None:
         """
-        Lazy-initialize DataLoader, GeneVocabulary, and LASSOEvaluator.
+        Lazy-initialize DataLoader, GeneVocabulary, and ADNCEvaluator.
 
         Called before each evaluate_stage1 invocation.  Loads resources only
         once; subsequent calls are no-ops.
@@ -187,8 +193,8 @@ class GeneSelectorEvaluator:
             adata_var_names=list(self._data_loader.adata.var_names),
         )
 
-        logger.info("Loading LASSOEvaluator from %s", self._config_path)
-        self._evaluator = LASSOEvaluator(config_path=self._config_path)
+        logger.info("Loading ADNCEvaluator from %s", self._config_path)
+        self._evaluator = ADNCEvaluator(config_path=self._config_path)
 
     def _validate_selection(
         self, selected_genes: object, all_genes: list[str]
@@ -239,13 +245,14 @@ class GeneSelectorEvaluator:
 
 def _build_suggestions(eval_result, selected_genes: list[str]) -> list[str]:
     """
-    Build human-readable suggestions from LASSO evaluation for LLM feedback.
+    Build human-readable suggestions from ADNC classification evaluation
+    results for LLM feedback.
 
-    Provides targeted advice based on how many genes were retained, which
-    targets scored low, and general guidance on improving the selection.
+    Provides targeted advice based on balanced accuracy, per-class F1 scores,
+    gene retention rate, and top-coefficient genes.
 
     Args:
-        eval_result: EvalResult from LASSOEvaluator.evaluate().
+        eval_result: EvalResult from ADNCEvaluator.evaluate().
         selected_genes: The 200-gene list that was evaluated.
 
     Returns:
@@ -257,38 +264,46 @@ def _build_suggestions(eval_result, selected_genes: list[str]) -> list[str]:
     retention_pct = round(100 * n_retained / n_selected) if n_selected else 0
 
     suggestions.append(
-        f"LASSO retained {n_retained}/{n_selected} genes ({retention_pct}%). "
-        f"The {n_selected - n_retained} zeroed genes should be replaced."
+        f"Logistic regression retained {n_retained}/{n_selected} genes "
+        f"({retention_pct}%). The {n_selected - n_retained} zeroed genes "
+        f"contribute nothing to ADNC classification and should be replaced."
     )
 
     if retention_pct < 10:
         suggestions.append(
-            "Very few genes were retained (<10%). Consider selecting genes from "
-            "established AD pathways (amyloid, tau, inflammation, synaptic)."
+            "Very few genes retained (<10%). Consider selecting genes from "
+            "established AD pathways (amyloid, tau, neuroinflammation, synaptic)."
         )
     elif retention_pct > 50:
         suggestions.append(
-            "Many genes were retained (>50%). The regularization may not be strong "
-            "enough — try replacing weakest genes with more targeted AD markers."
+            "Many genes retained (>50%). Try replacing the weakest genes with "
+            "more targeted ADNC-discriminating markers."
         )
 
-    # Identify best and worst targets.
-    valid_scores = {k: v for k, v in eval_result.scores.items() if v == v}  # exclude NaN
-    if valid_scores:
-        best_target = max(valid_scores, key=valid_scores.get)
-        worst_target = min(valid_scores, key=valid_scores.get)
+    # Highlight worst-performing ADNC class to guide selection.
+    if eval_result.per_class_f1:
+        worst_class = min(eval_result.per_class_f1, key=eval_result.per_class_f1.get)
+        best_class = max(eval_result.per_class_f1, key=eval_result.per_class_f1.get)
+        label_map = {"0": "Not AD", "1": "Low", "2": "Intermediate", "3": "High"}
+        worst_name = label_map.get(worst_class, worst_class)
+        best_name = label_map.get(best_class, best_class)
         suggestions.append(
-            f"Best target: {best_target} (r={valid_scores[best_target]:.3f}). "
-            f"Worst target: {worst_target} (r={valid_scores[worst_target]:.3f})."
+            f"Per-class F1 — best: {best_name} "
+            f"(F1={eval_result.per_class_f1[best_class]:.3f}), "
+            f"worst: {worst_name} "
+            f"(F1={eval_result.per_class_f1[worst_class]:.3f}). "
+            f"Add genes that specifically discriminate {worst_name} from other classes."
         )
 
-    # Suggest doubling down on top-coefficient genes' pathways.
+    # Suggest doubling down on top-coefficient gene pathways.
     if eval_result.coefficients:
         top_genes = sorted(
-            eval_result.coefficients, key=eval_result.coefficients.get, reverse=True
+            eval_result.coefficients,
+            key=eval_result.coefficients.get,
+            reverse=True,
         )[:5]
         suggestions.append(
-            f"Top 5 genes by LASSO coefficient: {top_genes}. "
+            f"Top 5 genes by logistic coefficient magnitude: {top_genes}. "
             f"Consider adding pathway-related genes for these."
         )
 

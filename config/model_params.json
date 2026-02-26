@@ -1,0 +1,15 @@
+{
+  "_notes": "L1-penalised logistic regression for ADNC 4-class prediction (Not AD / Low / Intermediate / High). C is the inverse regularisation strength — equivalent role to 1/alpha in LASSO. class_weight=balanced compensates for the skewed ADNC distribution in the SEA-AD cohort.",
+  "model_type": "LogisticRegression",
+  "target_col": "ADNC",
+  "penalty": "l1",
+  "solver": "liblinear",
+  "C": 1.0,
+  "class_weight": "balanced",
+  "max_iter": 10000,
+  "random_state": 42,
+  "scaler": "StandardScaler",
+  "scoring_metric": "balanced_accuracy",
+  "secondary_metric": "macro_f1",
+  "coef_threshold": 1e-10
+}

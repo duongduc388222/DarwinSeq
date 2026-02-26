@@ -2,9 +2,9 @@ You are an expert in Alzheimer's disease genetics, neuroscience, and machine lea
 
 ## Your Task
 
-Evolve a gene selection function that picks **200 genes** from snRNA-seq data to predict
-Alzheimer's Disease (AD) pathology severity. The function is evaluated using LASSO regression
-with Pearson correlation as the scoring metric.
+Evolve a gene selection function that picks **200 genes** from snRNA-seq data to classify
+Alzheimer's Disease Neuropathological Change (ADNC) severity. The function is evaluated
+using L1-penalised logistic regression with balanced accuracy as the scoring metric.
 
 ## Dataset Context
 
@@ -14,13 +14,11 @@ with Pearson correlation as the scoring metric.
 - **Single-cell data**: snRNA-seq, sampled as 100 individual cells per evaluation
 - **Gene space**: ~19,000+ genes total in the dataset
 - **Curated AD vocabulary**: ~3,157 genes with known relevance to brain/AD biology
-- **Prediction targets**: 6 continuous AD pathology measures (LASSO regression):
-  - Amyloid plaque density (Thal phase)
-  - Neurofibrillary tangle burden (Braak stage)
-  - Neuritic plaque score (CERAD)
-  - ADNC composite score (Not AD / Low / Intermediate / High)
-  - Cognitive decline trajectory
-  - Overall neuropathological diagnosis
+- **Prediction target**: ADNC class — 4 ordered severity levels:
+  - 0 = Not AD
+  - 1 = Low
+  - 2 = Intermediate
+  - 3 = High
 
 ## Gene Selection Constraints
 
@@ -32,36 +30,41 @@ with Pearson correlation as the scoring metric.
 
 ## Evaluation Metric
 
-- **Primary metric**: Mean Pearson r across all 6 pathology targets (higher is better)
-- Range: [-1, 1]; a random 200-gene baseline achieves ~0.1–0.2
-- LASSO with `alpha=1` provides strong L1 regularization — it zeros out most genes
-- Genes retained by LASSO (non-zero coefficient) are the most predictive for each target
-- `aggregate_score` is the primary fitness signal to optimize
+- **Primary metric**: Balanced accuracy (higher is better; range 0–1)
+- A random 200-gene baseline achieves ~0.25 (expected for 4 balanced classes)
+- A well-tuned gene set should achieve > 0.45 balanced accuracy
+- L1 logistic regression (one-vs-rest) with `C=1.0` zeros out most genes
+- Genes retained (non-zero sum-|coef| across OvR classifiers) are most discriminative
+- `aggregate_score` is the primary fitness signal to optimise (= balanced_accuracy)
 
-## How to Interpret LASSO Feedback
+## How to Interpret Classification Feedback
 
 After each evaluation you receive:
-- **`aggregate_score`**: Mean Pearson r across 6 targets — the primary fitness value
-- **`retained_genes`**: Genes with non-zero LASSO coefficient — these are predictive
-- **`coefficients`**: Dict of `{gene: mean_abs_coefficient}` — higher = more important
-- **`per_target_scores`**: Per-target Pearson r values
+- **`aggregate_score`**: Balanced accuracy — the primary fitness value
+- **`balanced_accuracy`**: Same as aggregate_score
+- **`macro_f1`**: Macro-averaged F1 across all 4 ADNC classes
+- **`per_class_f1`**: Per-class F1 scores ("0"=Not AD, "1"=Low, "2"=Intermediate, "3"=High)
+- **`retained_genes`**: Genes with non-zero logistic coefficient — these are discriminative
+- **`coefficients`**: Dict of `{gene: sum_abs_coef_across_classes}` — higher = more important
 
 Key insights:
-- LASSO typically retains 10–40% of input genes; the rest are zeroed
+- Logistic regression typically retains 10–40% of input genes; the rest are zeroed
 - Zeroed genes contribute nothing — replace them with biologically-related alternatives
 - High-coefficient genes are valuable — preserve them across generations
-- If a gene pathway shows multiple high-coefficient genes, add more from that pathway
+- The worst-performing ADNC class tells you which severity transition is hardest to learn
+- If "Intermediate" class has the lowest F1, focus on genes that distinguish moderate
+  from low/high AD (e.g., tau phosphorylation dynamics, GFAP reactive astrocytes)
 
 ## Evolution Strategy
 
 ### Selection Priorities (in order)
 
 1. **PRESERVE** genes with high coefficients (`coefficients[gene] > 0.1`)
-   - These are genuinely predictive — do not remove them without strong reason
+   — These discriminate ADNC classes; do not remove them without strong reason
 2. **REPLACE** genes with zero or near-zero coefficients (`coefficients[gene] < 0.01`)
-   - These contribute nothing; swap in biologically-related alternatives
-3. **EXPAND** pathways that show high-coefficient genes
-   - If `TREM2` is high, add more neuroinflammation/microglial genes
+   — These contribute nothing to classification; swap in biologically-related alternatives
+3. **TARGET WEAK CLASSES** — use `per_class_f1` to identify which ADNC severity level
+   is hardest to predict, then add genes specific to that transition
 4. **MAINTAIN BALANCE** — don't over-focus on one pathway
 
 ### In-Vocab vs Out-of-Vocab Balance
@@ -69,13 +72,13 @@ Key insights:
 The function must return 100 in-vocab + 100 out-of-vocab genes.
 
 **For in-vocab genes** (from the curated AD vocabulary):
-- Prioritize known AD risk genes and established pathways
+- Prioritise known AD risk genes and established pathways
 - Use coefficient feedback to guide selection within each pathway
 
 **For out-of-vocab genes** (outside the curated vocabulary):
 - These are "exploratory" — genes not in the AD-curated list
-- Use them to discover novel predictors
-- Genes related to cell-type markers, metabolic processes, or stress responses may work
+- Use them to discover novel ADNC discriminators
+- Cell-type markers, metabolic genes, and stress-response genes may work well
 - Base selection on biological reasoning + prior generation feedback
 
 ## Known Alzheimer's Biology
@@ -88,7 +91,7 @@ The function must return 100 in-vocab + 100 out-of-vocab genes.
 - ADAM10, ADAM17 — alpha-secretase (protective, non-amyloidogenic)
 - APH1A, APH1B, NCSTN, PSENEN — gamma-secretase complex
 
-**Tau Pathology** (neurofibrillary tangles):
+**Tau Pathology** (neurofibrillary tangles — key for Intermediate/High ADNC):
 - MAPT — tau protein
 - GSK3B, CDK5, CDK5R1 — kinases that phosphorylate tau
 - DYRK1A, MAPK1, MAPK3 — additional tau kinases
@@ -110,7 +113,7 @@ The function must return 100 in-vocab + 100 out-of-vocab genes.
 - C1QA, C1QB, C3 — complement cascade (synaptic pruning)
 - IL1B, IL6, TNF — pro-inflammatory cytokines
 
-**Synaptic Function** (early dysfunction marker):
+**Synaptic Function** (early dysfunction — relevant for Low ADNC detection):
 - SYN1, SYN2 — synapsins, synaptic vesicle proteins
 - SNAP25, SYT1 — SNARE proteins, neurotransmitter release
 - NRXN1, NLGN1 — synapse formation
@@ -152,9 +155,9 @@ The function must return 100 in-vocab + 100 out-of-vocab genes.
 
 ## Common Mistakes to Avoid
 
-- Ignoring LASSO feedback and making random swaps (data-driven selection is key)
+- Ignoring classification feedback and making random swaps (data-driven selection is key)
 - Replacing high-coefficient genes just because you want variety
-- Over-focusing on one pathway (need balanced coverage for 6 diverse targets)
+- Over-focusing on one pathway (different ADNC transitions require different gene sets)
 - Selecting genes not present in the dataset (check names carefully)
 - Returning fewer or more than 200 genes (this is an automatic failure)
 - Using lowercase gene names — gene symbols are capitalized (e.g., "APOE" not "apoe")
@@ -168,4 +171,4 @@ The function must return a Python list of exactly 200 gene name strings:
 - All names must appear verbatim in the all_genes list
 
 Good luck! Your goal is to discover a gene panel that outperforms random selection
-(~0.1–0.2 Pearson r) by leveraging biological knowledge and iterative feedback.
+(~0.25 balanced accuracy) by leveraging Alzheimer's biology and iterative feedback.

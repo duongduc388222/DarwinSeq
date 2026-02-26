@@ -1,99 +1,114 @@
 """
-tests/test_evaluator.py — Unit tests for LASSOEvaluator and EvalResult.
+tests/test_evaluator.py — Unit tests for ADNCEvaluator and EvalResult.
 
 All tests use synthetic DataFrames — no real h5ad file is required.
 """
 
-import math
+import json
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from src.evaluator import EvalResult, LASSOEvaluator
+from src.evaluator import ADNCEvaluator, EvalResult
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_evaluator(tmp_path, alpha=0.01):
-    """Write a minimal lasso_params.json and return a LASSOEvaluator."""
-    import json
-    cfg = {
-        "_notes": "test config",
-        "model_type": "Lasso",
-        "fit_one_per_target": True,
-        "alpha": alpha,
-        "fit_intercept": True,
-        "max_iter": 10000,
-        "random_state": 42,
-        "scaler": "StandardScaler",
-        "scoring_metric": "pearson_r",
-        "aggregate_fn": "mean",
-        "nan_policy": "drop_per_target",
-        "coef_threshold": 1e-10,
-    }
-    cfg_path = tmp_path / "lasso_params.json"
-    cfg_path.write_text(json.dumps(cfg))
-    return LASSOEvaluator(config_path=str(cfg_path))
 
-
-def _make_sparse_data(n=80, n_genes=20, signal_genes=None, seed=0):
+def _make_evaluator(tmp_path):
     """
-    Build a synthetic (X, y) pair where y is a linear combination of a small
-    set of signal_genes plus Gaussian noise.
+    Write a minimal model_params.json and return an ADNCEvaluator.
 
     Args:
-        n: Number of samples.
-        n_genes: Total number of genes.
-        signal_genes: List of column indices carrying the signal (default [0,1]).
-        seed: Random seed.
+        tmp_path: pytest-provided temporary directory (pathlib.Path).
 
     Returns:
-        (X, y) as DataFrames with gene_0..gene_{n_genes-1} columns and
-        target_0 as the single target column.
+        ADNCEvaluator instance configured with small max_iter for fast tests.
     """
-    if signal_genes is None:
-        signal_genes = [0, 1]
+    cfg = {
+        "model_type": "LogisticRegression",
+        "target_col": "ADNC",
+        "penalty": "l1",
+        "solver": "liblinear",
+        "C": 1.0,
+        "class_weight": "balanced",
+        "max_iter": 5000,
+        "random_state": 42,
+        "scaler": "StandardScaler",
+        "scoring_metric": "balanced_accuracy",
+        "secondary_metric": "macro_f1",
+        "coef_threshold": 1e-10,
+    }
+    cfg_path = tmp_path / "model_params.json"
+    cfg_path.write_text(json.dumps(cfg))
+    return ADNCEvaluator(config_path=str(cfg_path))
+
+
+def _make_4class_data(n_per_class=30, n_genes=50, seed=0):
+    """
+    Build a synthetic (X, y) pair with 4 balanced ADNC classes.
+
+    Each class is driven by a disjoint set of signal genes to ensure
+    the classifier can achieve above-chance balanced accuracy.
+
+    Args:
+        n_per_class: Number of samples per ADNC class.
+        n_genes: Total number of genes (features).
+        seed: Random seed for reproducibility.
+
+    Returns:
+        Tuple of:
+          - X: DataFrame of shape (n_per_class * 4, n_genes).
+          - y: Single-column DataFrame with column "ADNC" containing integers 0–3.
+    """
     rng = np.random.default_rng(seed)
-    X_vals = rng.standard_normal((n, n_genes))
-    coefs = np.zeros(n_genes)
-    for idx in signal_genes:
-        coefs[idx] = rng.uniform(1.0, 3.0)
-    y_vals = X_vals @ coefs + 0.05 * rng.standard_normal(n)
+    n_total = n_per_class * 4
+    X_vals = rng.standard_normal((n_total, n_genes))
+    y_vals = np.repeat([0, 1, 2, 3], n_per_class)
+
+    # Add class-specific signal: each class boosts a disjoint block of genes.
+    block = n_genes // 4
+    for cls in range(4):
+        mask = y_vals == cls
+        X_vals[mask, cls * block:(cls + 1) * block] += 3.0
 
     gene_cols = [f"gene_{i}" for i in range(n_genes)]
     X = pd.DataFrame(X_vals, columns=gene_cols)
-    y = pd.DataFrame({"target_0": y_vals})
-    return X, y, [f"gene_{i}" for i in signal_genes]
+    y = pd.DataFrame({"ADNC": y_vals.astype(float)})
+    return X, y
 
 
 # ---------------------------------------------------------------------------
 # 1. Config loading
 # ---------------------------------------------------------------------------
 
+
 def test_missing_config_raises(tmp_path):
     """FileNotFoundError raised when config path does not exist."""
     with pytest.raises(FileNotFoundError):
-        LASSOEvaluator(config_path=str(tmp_path / "nonexistent.json"))
+        ADNCEvaluator(config_path=str(tmp_path / "nonexistent.json"))
 
 
 def test_default_config_loads():
-    """Default config file (config/lasso_params.json) loads without error."""
-    ev = LASSOEvaluator()
-    assert ev._alpha > 0
+    """Default config file (config/model_params.json) loads without error."""
+    ev = ADNCEvaluator()
+    assert ev._C > 0
+    assert ev._penalty == "l1"
 
 
 # ---------------------------------------------------------------------------
 # 2. Shape mismatch
 # ---------------------------------------------------------------------------
 
+
 def test_shape_mismatch_raises(tmp_path):
     """ValueError raised when X and y have different numbers of rows."""
     ev = _make_evaluator(tmp_path)
     X = pd.DataFrame(np.ones((10, 5)), columns=[f"g{i}" for i in range(5)])
-    y = pd.DataFrame({"t": np.ones(8)})
+    y = pd.DataFrame({"ADNC": np.ones(8)})
     with pytest.raises(ValueError, match="same number of rows"):
         ev.evaluate(X, y)
 
@@ -102,165 +117,198 @@ def test_shape_mismatch_raises(tmp_path):
 # 3. Empty inputs
 # ---------------------------------------------------------------------------
 
-def test_empty_X_returns_default(tmp_path):
+
+def test_empty_returns_default(tmp_path):
     """Empty X returns a zero-score EvalResult without crashing."""
     ev = _make_evaluator(tmp_path)
     X = pd.DataFrame(columns=["g0", "g1"])
-    y = pd.DataFrame(columns=["t0"])
+    y = pd.DataFrame(columns=["ADNC"])
     result = ev.evaluate(X, y)
     assert result.aggregate_score == 0.0
+    assert result.balanced_accuracy == 0.0
     assert result.retained_genes == []
 
 
 # ---------------------------------------------------------------------------
-# 4. Synthetic signal recovery
+# 4. Basic 4-class classification
 # ---------------------------------------------------------------------------
 
-def test_signal_genes_retained(tmp_path):
+
+def test_basic_4class(tmp_path):
     """
-    With a small alpha, LASSO should assign non-zero coefficients to genes
-    that carry the true signal.
+    With 4 balanced classes and class-specific signal genes, balanced
+    accuracy and macro F1 must be above chance (> 0.25 for 4 classes).
     """
-    ev = _make_evaluator(tmp_path, alpha=0.001)
-    X, y, signal_gene_names = _make_sparse_data(n=100, n_genes=20, signal_genes=[0, 1])
-    result = ev.evaluate(X, y)
-    for sg in signal_gene_names:
-        assert sg in result.retained_genes, (
-            f"Expected signal gene '{sg}' in retained_genes, got {result.retained_genes}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# 5. Retained genes subset property
-# ---------------------------------------------------------------------------
-
-def test_retained_genes_subset_of_input_columns(tmp_path):
-    """retained_genes must be a subset of input gene column names."""
     ev = _make_evaluator(tmp_path)
-    X, y, _ = _make_sparse_data(n=80, n_genes=15)
+    X, y = _make_4class_data(n_per_class=30, n_genes=50)
     result = ev.evaluate(X, y)
-    assert set(result.retained_genes) <= set(X.columns)
+    assert result.balanced_accuracy > 0.25, (
+        f"Expected balanced_accuracy > 0.25 but got {result.balanced_accuracy:.4f}"
+    )
+    assert result.macro_f1 > 0.0
 
 
 # ---------------------------------------------------------------------------
-# 6. Score range
+# 5. Degenerate: single class present
 # ---------------------------------------------------------------------------
 
-def test_scores_in_valid_range(tmp_path):
-    """All per-target Pearson r values must lie in [-1, 1]."""
+
+def test_degenerate_single_class(tmp_path):
+    """All cells with the same ADNC class returns zero result without error."""
     ev = _make_evaluator(tmp_path)
-    X, y, _ = _make_sparse_data(n=80, n_genes=15)
+    n = 40
+    X = pd.DataFrame(np.random.randn(n, 10), columns=[f"g{i}" for i in range(10)])
+    y = pd.DataFrame({"ADNC": np.zeros(n)})  # only class 0
     result = ev.evaluate(X, y)
-    for target, r in result.scores.items():
-        assert -1.0 <= r <= 1.0, f"Score for '{target}' out of range: {r}"
-    assert -1.0 <= result.aggregate_score <= 1.0
+    assert result.balanced_accuracy == 0.0
+    assert result.macro_f1 == 0.0
+    assert result.retained_genes == []
 
 
 # ---------------------------------------------------------------------------
-# 7. Determinism
+# 6. All NaN returns zero result
 # ---------------------------------------------------------------------------
 
-def test_determinism(tmp_path):
-    """Same X and y must produce identical EvalResult on two consecutive calls."""
+
+def test_all_nan_returns_zero(tmp_path):
+    """All-NaN ADNC values return zero result without crashing."""
     ev = _make_evaluator(tmp_path)
-    X, y, _ = _make_sparse_data(n=80, n_genes=15)
+    n = 40
+    X = pd.DataFrame(np.random.randn(n, 10), columns=[f"g{i}" for i in range(10)])
+    y = pd.DataFrame({"ADNC": [float("nan")] * n})
+    result = ev.evaluate(X, y)
+    assert result.balanced_accuracy == 0.0
+    assert result.retained_genes == []
+
+
+# ---------------------------------------------------------------------------
+# 7. NaN rows dropped before fitting
+# ---------------------------------------------------------------------------
+
+
+def test_nan_rows_dropped(tmp_path):
+    """
+    NaN rows in y are silently dropped; the evaluator still runs on valid rows.
+    With ≥ 2 classes in the non-NaN subset it must not crash and must return
+    a non-trivially zero result.
+    """
+    ev = _make_evaluator(tmp_path)
+    X, y = _make_4class_data(n_per_class=30, n_genes=50)
+    # Zero out half the labels.
+    y_partial = y.copy()
+    y_partial.iloc[: len(y) // 2, 0] = float("nan")
+    # Should not raise; should still produce a result.
+    result = ev.evaluate(X, y_partial)
+    assert isinstance(result.balanced_accuracy, float)
+
+
+# ---------------------------------------------------------------------------
+# 8. Retained genes are a subset of input columns
+# ---------------------------------------------------------------------------
+
+
+def test_retained_genes_subset(tmp_path):
+    """retained_genes must be a subset of the gene column names in X."""
+    ev = _make_evaluator(tmp_path)
+    X, y = _make_4class_data(n_per_class=25, n_genes=40)
+    result = ev.evaluate(X, y)
+    assert set(result.retained_genes) <= set(X.columns), (
+        f"retained_genes contains names not in X.columns: "
+        f"{set(result.retained_genes) - set(X.columns)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 9. Determinism
+# ---------------------------------------------------------------------------
+
+
+def test_deterministic(tmp_path):
+    """Same (X, y) called twice must produce identical EvalResult."""
+    ev = _make_evaluator(tmp_path)
+    X, y = _make_4class_data(n_per_class=25, n_genes=40)
     r1 = ev.evaluate(X, y)
     r2 = ev.evaluate(X, y)
-    assert r1.aggregate_score == r2.aggregate_score
+    assert r1.balanced_accuracy == r2.balanced_accuracy
+    assert r1.macro_f1 == r2.macro_f1
     assert r1.retained_genes == r2.retained_genes
-    assert r1.scores == r2.scores
     assert r1.coefficients == r2.coefficients
+    assert r1.per_class_f1 == r2.per_class_f1
 
 
 # ---------------------------------------------------------------------------
-# 8. NaN handling in y
+# 10. aggregate_score is an alias for balanced_accuracy
 # ---------------------------------------------------------------------------
 
-def test_all_nan_target_skipped(tmp_path):
-    """A target column that is entirely NaN is skipped gracefully."""
+
+def test_aggregate_score_alias(tmp_path):
+    """EvalResult.aggregate_score must equal EvalResult.balanced_accuracy."""
     ev = _make_evaluator(tmp_path)
-    X, y, _ = _make_sparse_data(n=80, n_genes=10)
-    y["all_nan_target"] = float("nan")
+    X, y = _make_4class_data(n_per_class=25, n_genes=40)
     result = ev.evaluate(X, y)
-    assert "all_nan_target" not in result.scores
-
-
-def test_partial_nan_target_uses_valid_rows(tmp_path):
-    """A target with some NaN values is still evaluated on non-NaN rows."""
-    ev = _make_evaluator(tmp_path, alpha=0.001)
-    X, y, _ = _make_sparse_data(n=80, n_genes=10)
-    # Zero out half the target values to NaN.
-    y_partial = y.copy()
-    y_partial.loc[y_partial.index[:40], "target_0"] = float("nan")
-    result = ev.evaluate(X, y_partial)
-    assert "target_0" in result.scores
+    assert result.aggregate_score == result.balanced_accuracy
 
 
 # ---------------------------------------------------------------------------
-# 9. Multi-target: union of retained genes
+# 11. n_retained consistency
 # ---------------------------------------------------------------------------
 
-def test_multi_target_union_retained(tmp_path):
-    """
-    With two targets driven by disjoint signal genes, retained_genes should
-    cover genes from both targets.
-    """
-    ev = _make_evaluator(tmp_path, alpha=0.001)
-    rng = np.random.default_rng(99)
-    n, n_genes = 100, 20
-    X_vals = rng.standard_normal((n, n_genes))
-    gene_cols = [f"gene_{i}" for i in range(n_genes)]
 
-    # target_0 driven by gene_0; target_1 driven by gene_10.
-    y0 = X_vals[:, 0] * 3.0 + 0.05 * rng.standard_normal(n)
-    y1 = X_vals[:, 10] * 3.0 + 0.05 * rng.standard_normal(n)
-    X = pd.DataFrame(X_vals, columns=gene_cols)
-    y = pd.DataFrame({"t0": y0, "t1": y1})
-
-    result = ev.evaluate(X, y)
-    assert "gene_0" in result.retained_genes
-    assert "gene_10" in result.retained_genes
-    assert len(result.scores) == 2
-
-
-# ---------------------------------------------------------------------------
-# 10. n_retained consistency
-# ---------------------------------------------------------------------------
-
-def test_n_retained_matches_retained_genes_length(tmp_path):
+def test_n_retained_consistency(tmp_path):
     """EvalResult.n_retained must equal len(retained_genes)."""
     ev = _make_evaluator(tmp_path)
-    X, y, _ = _make_sparse_data(n=80, n_genes=15)
+    X, y = _make_4class_data(n_per_class=25, n_genes=40)
     result = ev.evaluate(X, y)
     assert result.n_retained == len(result.retained_genes)
 
 
 # ---------------------------------------------------------------------------
-# 11. Coefficients keys match retained_genes
+# 12. Coefficients keys match retained_genes
 # ---------------------------------------------------------------------------
 
-def test_coefficients_keys_match_retained_genes(tmp_path):
+
+def test_coefficients_keys_match_retained(tmp_path):
     """coefficients dict keys must equal the set of retained_genes."""
     ev = _make_evaluator(tmp_path)
-    X, y, _ = _make_sparse_data(n=80, n_genes=15)
+    X, y = _make_4class_data(n_per_class=25, n_genes=40)
     result = ev.evaluate(X, y)
     assert set(result.coefficients.keys()) == set(result.retained_genes)
 
 
 # ---------------------------------------------------------------------------
-# 12. EvalResult is a plain dataclass (picklable / inspectable)
+# 13. per_class_f1 covers present classes
 # ---------------------------------------------------------------------------
+
+
+def test_per_class_f1_keys(tmp_path):
+    """per_class_f1 must contain string keys for each class in the data."""
+    ev = _make_evaluator(tmp_path)
+    X, y = _make_4class_data(n_per_class=25, n_genes=40)
+    result = ev.evaluate(X, y)
+    # All 4 classes are present in the synthetic data.
+    assert set(result.per_class_f1.keys()) == {"0", "1", "2", "3"}
+    for cls_f1 in result.per_class_f1.values():
+        assert 0.0 <= cls_f1 <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# 14. EvalResult is a plain dataclass (constructable directly)
+# ---------------------------------------------------------------------------
+
 
 def test_evalresult_fields():
     """EvalResult can be constructed directly and fields are accessible."""
     r = EvalResult(
-        scores={"t0": 0.5},
-        aggregate_score=0.5,
-        retained_genes=["g1"],
-        coefficients={"g1": 0.3},
-        n_retained=1,
+        balanced_accuracy=0.6,
+        macro_f1=0.55,
+        aggregate_score=0.6,
+        retained_genes=["APOE", "TREM2"],
+        coefficients={"APOE": 0.4, "TREM2": 0.3},
+        n_retained=2,
+        per_class_f1={"0": 0.7, "1": 0.5, "2": 0.6, "3": 0.65},
     )
-    assert r.scores == {"t0": 0.5}
-    assert r.aggregate_score == 0.5
-    assert r.retained_genes == ["g1"]
-    assert r.n_retained == 1
+    assert r.balanced_accuracy == 0.6
+    assert r.aggregate_score == r.balanced_accuracy
+    assert r.n_retained == 2
+    assert "APOE" in r.retained_genes
+    assert r.per_class_f1["0"] == 0.7
