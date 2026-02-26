@@ -12,6 +12,7 @@ evolution:
   num_islands: 1            # Single island (parallel islands require more API budget)
   checkpoint_interval: 1    # Save checkpoint after every generation
   random_seed: 42
+  diff_based_evolution: false  # gemini-2.5-pro ignores SEARCH/REPLACE format; full rewrite is more reliable
 
 # ── LLM configuration ────────────────────────────────────────────────────────
 llm:
@@ -47,6 +48,52 @@ system_message: |
   Alzheimer's Disease Neuropathological Change (ADNC) severity. The function is evaluated
   using L1-penalised logistic regression with balanced accuracy as the scoring metric.
 
+  ## CRITICAL: How Your Function Is Called
+
+  Your rewritten function is called EXACTLY like this at evaluation time:
+      selected_genes = select_genes(gene_vocabulary, all_genes)
+
+  The `previous_results` parameter is **ALWAYS None** — it is never passed.
+  **DO NOT** write code that checks `if previous_results is None` and falls back to
+  random selection. That is the initial template behaviour and it achieves only ~0.25.
+
+  Instead, use the evaluation feedback shown in the prompt (retained_genes, coefficients,
+  per_class_f1) to write **hardcoded biology-informed gene priorities** that are then
+  filtered against the runtime `gene_vocabulary` and `all_genes` parameters.
+
+  ## CRITICAL: Response Format
+
+  Return a COMPLETE Python function in a single code block. Your response must contain:
+
+  ```python
+  def select_genes(
+      gene_vocabulary: list,
+      all_genes: list,
+      previous_results: dict | None = None,
+  ) -> list:
+      """..."""
+      import random
+
+      # Your improved selection logic here.
+      # - Use hardcoded priority gene lists based on AD biology and feedback
+      # - ALWAYS filter against gene_vocabulary / all_genes at runtime
+      # - MUST return exactly 100 in-vocab + 100 out-of-vocab genes
+
+      vocab_set = set(gene_vocabulary)
+      all_genes_set = set(all_genes)
+      out_of_vocab = [g for g in all_genes if g not in vocab_set]
+
+      # ... your logic ...
+
+      return in_vocab_selected + out_vocab_selected
+  ```
+
+  Rules:
+  - Return the complete function definition (including `def select_genes(...)`)
+  - ALWAYS filter any hardcoded gene names against `all_genes` — never assume a name exists
+  - ALWAYS ensure exactly 100 in-vocab and 100 out-of-vocab genes are returned
+  - Include a random-fill fallback only for padding when your priority list is exhausted
+
   ## Dataset Context
 
   - **Study**: SEA-AD DREAM Challenge (Seattle Alzheimer's Disease Brain Cell Atlas)
@@ -55,178 +102,47 @@ system_message: |
   - **Single-cell data**: snRNA-seq, sampled as 100 individual cells per evaluation
   - **Gene space**: ~19,000+ genes total in the dataset
   - **Curated AD vocabulary**: ~3,157 genes with known relevance to brain/AD biology
-  - **Prediction target**: ADNC class — 4 ordered severity levels:
-    - 0 = Not AD
-    - 1 = Low
-    - 2 = Intermediate
-    - 3 = High
-
-  ## Gene Selection Constraints
-
-  - Return **exactly 200 genes** (this is enforced by the evaluator — any other count fails)
-  - Exactly **100 genes from the curated AD vocabulary** (in-vocab)
-  - Exactly **100 genes from outside the vocabulary** (out-of-vocab)
-  - All gene names must match the dataset exactly (case-sensitive, e.g., "APOE" not "apoe")
-  - No duplicate genes in the output
+  - **Prediction target**: ADNC class — 4 ordered severity levels (Not AD=0, Low=1, Intermediate=2, High=3)
 
   ## Evaluation Metric
 
   - **Primary metric**: Balanced accuracy (higher is better; range 0–1)
-  - A random 200-gene baseline achieves ~0.25 (expected for 4 balanced classes)
-  - A well-tuned gene set should achieve > 0.45 balanced accuracy
-  - L1 logistic regression (one-vs-rest) with `C=1.0` zeros out most genes
-  - Genes retained (non-zero sum-|coef| across OvR classifiers) are most discriminative
-  - `aggregate_score` is the primary fitness signal to optimise (= balanced_accuracy)
+  - Random 200-gene baseline ≈ 0.25 (expected for 4 balanced classes)
+  - Target: > 0.45 balanced accuracy
+  - L1 logistic regression zeros out weak genes; `retained_genes` are the ADNC discriminators
+  - `aggregate_score` = `balanced_accuracy` is the fitness signal to maximise
 
-  ## How to Interpret Classification Feedback
+  ## How to Interpret Feedback
 
-  After each evaluation you receive:
-  - **`aggregate_score`**: Balanced accuracy — the primary fitness value
-  - **`balanced_accuracy`**: Same as aggregate_score
-  - **`macro_f1`**: Macro-averaged F1 across all 4 ADNC classes
-  - **`per_class_f1`**: Per-class F1 scores ("0"=Not AD, "1"=Low, "2"=Intermediate, "3"=High)
-  - **`retained_genes`**: Genes with non-zero logistic coefficient — these are discriminative
-  - **`coefficients`**: Dict of `{gene: sum_abs_coef_across_classes}` — higher = more important
-
-  Key insights:
-  - Logistic regression typically retains 10–40% of input genes; the rest are zeroed
-  - Zeroed genes contribute nothing — replace them with biologically-related alternatives
-  - High-coefficient genes are valuable — preserve them across generations
-  - The worst-performing ADNC class tells you which severity transition is hardest to learn
-  - If "Intermediate" class has the lowest F1, focus on genes that distinguish moderate
-    from low/high AD (e.g., tau phosphorylation dynamics, GFAP reactive astrocytes)
+  After each evaluation:
+  - **`balanced_accuracy`**: Primary fitness — maximise this
+  - **`per_class_f1`**: F1 per class — find the worst class and add genes for it
+  - **`retained_genes`**: Genes with non-zero logistic coefficient — keep these
+  - **`coefficients`**: {gene: sum_abs_coef} — higher = more important, preserve these
 
   ## Evolution Strategy
 
-  ### Selection Priorities (in order)
+  1. **PRESERVE** genes from `retained_genes` with high `coefficients` (> 0.1)
+  2. **REPLACE** genes absent from `retained_genes` — swap for biology-related alternatives
+  3. **IMPROVE worst class**: if one ADNC class has low F1, add genes for that transition
+  4. **EXPAND** pathways that show high-coefficient genes
 
-  1. **PRESERVE** genes with high coefficients (`coefficients[gene] > 0.1`)
-     — These discriminate ADNC classes; do not remove them without strong reason
-  2. **REPLACE** genes with zero or near-zero coefficients (`coefficients[gene] < 0.01`)
-     — These contribute nothing to classification; swap in biologically-related alternatives
-  3. **TARGET WEAK CLASSES** — use `per_class_f1` to identify which ADNC severity level
-     is hardest to predict, then add genes specific to that transition
-  4. **MAINTAIN BALANCE** — don't over-focus on one pathway
+  ## Known AD Gene Pathways
 
-  ### In-Vocab vs Out-of-Vocab Balance
+  **Amyloid**: APP, PSEN1, PSEN2, BACE1, ADAM10, APH1A, NCSTN
+  **Tau**: MAPT, GSK3B, CDK5, CDK5R1, DYRK1A, MAPK1, MAPK3
+  **APOE/Lipid**: APOE, CLU, SORL1, LRP1, ABCA7, ABCA1, BIN1, PICALM
+  **Neuroinflammation**: TREM2, CD33, INPP5D, TYROBP, CX3CR1, CSF1R, C1QA, C1QB, C3
+  **Synaptic**: SYN1, SYN2, SNAP25, SYT1, NRXN1, GRIN1, GRIN2B, DLG4
+  **Autophagy**: SQSTM1, ATG7, ATG5, BECN1, LAMP2, CTSD, CTSB
+  **Oxidative stress**: SOD1, SOD2, CAT, GPX1, PINK1, PRKN
+  **Cell type — neurons**: GAD1, GAD2, PVALB, SST, SLC17A7, CAMK2A, GRIA2
+  **Cell type — glia**: GFAP, AQP4, MBP, MOBP, AIF1, P2RY12, TMEM119
+  **GWAS hits**: BIN1, CR1, PICALM, MS4A6A, CD2AP, EPHA1, MEF2C, INPP5D
 
-  The function must return 100 in-vocab + 100 out-of-vocab genes.
+  ## Constraints
 
-  **For in-vocab genes** (from the curated AD vocabulary):
-  - Prioritise known AD risk genes and established pathways
-  - Use coefficient feedback to guide selection within each pathway
-
-  **For out-of-vocab genes** (outside the curated vocabulary):
-  - These are "exploratory" — genes not in the AD-curated list
-  - Use them to discover novel ADNC discriminators
-  - Cell-type markers, metabolic genes, and stress-response genes may work well
-  - Base selection on biological reasoning + prior generation feedback
-
-  ## Known Alzheimer's Biology
-
-  ### Core Pathways
-
-  **Amyloid Processing** (primary AD pathology):
-  - APP, PSEN1, PSEN2 — amyloid precursor and processing
-  - BACE1, BACE2 — beta-secretase cleavage
-  - ADAM10, ADAM17 — alpha-secretase (protective, non-amyloidogenic)
-  - APH1A, APH1B, NCSTN, PSENEN — gamma-secretase complex
-
-  **Tau Pathology** (neurofibrillary tangles — key for Intermediate/High ADNC):
-  - MAPT — tau protein
-  - GSK3B, CDK5, CDK5R1 — kinases that phosphorylate tau
-  - DYRK1A, MAPK1, MAPK3 — additional tau kinases
-  - PPP2R1A, PPP2CA — phosphatases (tau dephosphorylation)
-
-  **APOE & Lipid Metabolism** (strongest genetic risk factor):
-  - APOE — ε4 allele = strongest common genetic risk factor
-  - CLU — clusterin, lipid/amyloid chaperone
-  - SORL1, LRP1 — lipoprotein receptors (Aβ clearance)
-  - ABCA7, ABCA1 — cholesterol efflux transporters
-  - BIN1, PICALM — endocytosis/lipid-related GWAS hits
-
-  **Neuroinflammation & Microglia** (disease progression driver):
-  - TREM2 — triggering receptor, rare variants confer high AD risk
-  - CD33 — inhibits microglial phagocytosis of amyloid
-  - INPP5D (SHIP1) — microglial signaling regulator
-  - TYROBP (DAP12) — TREM2 co-receptor
-  - CX3CR1, CSF1R, ITGAM — microglial surface receptors
-  - C1QA, C1QB, C3 — complement cascade (synaptic pruning)
-  - IL1B, IL6, TNF — pro-inflammatory cytokines
-
-  **Synaptic Function** (early dysfunction — relevant for Low ADNC detection):
-  - SYN1, SYN2 — synapsins, synaptic vesicle proteins
-  - SNAP25, SYT1 — SNARE proteins, neurotransmitter release
-  - NRXN1, NLGN1 — synapse formation
-  - GRIN1, GRIN2B, GRIA1 — glutamate receptors
-  - DLG4 (PSD-95) — postsynaptic scaffold
-  - SHANK2, SHANK3 — scaffolding proteins
-
-  **Autophagy & Protein Degradation**:
-  - SQSTM1 (p62) — autophagy cargo receptor
-  - OPTN, VCP — protein quality control
-  - ATG7, ATG5, BECN1 — autophagy machinery
-  - LAMP1, LAMP2 — lysosomal markers
-  - CTSD, CTSB — lysosomal cathepsins (Aβ degradation)
-
-  **Oxidative Stress & Mitochondria**:
-  - SOD1, SOD2 — superoxide dismutases
-  - CAT, GPX1 — antioxidant enzymes
-  - PINK1, PRKN — mitophagy
-  - TFAM, POLG — mitochondrial genome maintenance
-  - COX4I1, ATP5F1A — oxidative phosphorylation
-
-  **Calcium Signaling**:
-  - CACNA1C, CACNA1D — voltage-gated calcium channels
-  - ITPR1 — IP3 receptor (ER calcium release)
-  - CALM1, CAMK2A — calcium/calmodulin signaling
-  - RYR2, RYR3 — ryanodine receptors
-
-  **Cell Type Markers** (relevant for snRNA-seq):
-  - GABAergic neurons: GAD1, GAD2, PVALB, SST, VIP
-  - Glutamatergic neurons: SLC17A7, SLC17A6, CAMK2A, GRIA2
-  - Oligodendrocytes: MBP, MOBP, CNP, PLP1
-  - Astrocytes: GFAP, AQP4, GJA1
-  - Microglia: AIF1, P2RY12, CX3CR1, TMEM119
-
-  **GWAS Risk Genes** (validated by population genetics):
-  - BIN1, CR1, PICALM, MS4A6A, MS4A4E, CD2AP
-  - EPHA1, PTK2B, MEF2C, NME8, ZCWPW1, FERMT2
-  - SLC24A4, CASS4, INPP5D, HLA-DRB1
-
-  ## Common Mistakes to Avoid
-
-  - Ignoring classification feedback and making random swaps (data-driven selection is key)
-  - Replacing high-coefficient genes just because you want variety
-  - Over-focusing on one pathway (different ADNC transitions require different gene sets)
-  - Selecting genes not present in the dataset (check names carefully)
-  - Returning fewer or more than 200 genes (this is an automatic failure)
-  - Using lowercase gene names — gene symbols are capitalized (e.g., "APOE" not "apoe")
-
-  ## Output Format
-
-  The function must return a Python list of exactly 200 gene name strings:
-  - First 100: in-vocab genes (from gene_vocabulary argument)
-  - Last 100: out-of-vocab genes (from all_genes but NOT in gene_vocabulary)
-  - No duplicates between in-vocab and out-of-vocab selections
-  - All names must appear verbatim in the all_genes list
-
-  Good luck! Your goal is to discover a gene panel that outperforms random selection
-  (~0.25 balanced accuracy) by leveraging Alzheimer's biology and iterative feedback.
-
-  ## CRITICAL: How to Format Your Response
-
-  You MUST use the SEARCH/REPLACE diff format. Return one or more blocks like this:
-
-  <<<<<<< SEARCH
-  # exact code from the current program to replace
-  =======
-  # your new replacement code
-  >>>>>>> REPLACE
-
-  Rules:
-  - The SEARCH section must match the existing code EXACTLY (character for character)
-  - Only modify code between `# EVOLVE-BLOCK-START` and `# EVOLVE-BLOCK-END`
-  - Do NOT include the marker lines themselves in a SEARCH/REPLACE block
-  - You may include multiple SEARCH/REPLACE blocks for multiple changes
-  - Do NOT rewrite the entire file — make targeted changes inside the evolve block only
+  - Return **exactly 200 genes**: 100 in-vocab + 100 out-of-vocab
+  - All gene names are case-sensitive (e.g., "APOE" not "apoe")
+  - No duplicates within or between the two groups
+  - All names must exist in `all_genes` (filter at runtime — never hardcode assumptions)
