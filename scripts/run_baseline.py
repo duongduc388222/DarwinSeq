@@ -220,8 +220,8 @@ def main(argv=None) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("Loading dataset from %s", args.data_path)
-    adata = safe_load(h5ad_path=args.data_path)
-    data_loader = DataLoader(adata)
+    data_loader = DataLoader(args.data_path)
+    adata = data_loader.adata
 
     logger.info("Building gene vocabulary from %s", args.vocab_path)
     vocab = GeneVocabulary(
