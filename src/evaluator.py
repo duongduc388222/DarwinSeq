@@ -19,9 +19,15 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import sklearn
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import balanced_accuracy_score, f1_score
+from sklearn.multiclass import OneVsRestClassifier
 from sklearn.preprocessing import StandardScaler
+
+# sklearn ≥1.8 deprecates 'penalty' in favour of 'l1_ratio'.
+# sklearn ≥1.8 also requires OneVsRestClassifier for liblinear multiclass.
+_SKLEARN_GE_18 = tuple(int(x) for x in sklearn.__version__.split(".")[:2]) >= (1, 8)
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +86,7 @@ class ADNCEvaluator:
             self._params = json.load(fh)
 
         self._C: float = float(self._params["C"])
-        self._penalty: str = str(self._params["penalty"])
+        self._l1_ratio: float = float(self._params["l1_ratio"])
         self._solver: str = str(self._params["solver"])
         self._class_weight = self._params["class_weight"]
         self._max_iter: int = int(self._params["max_iter"])
@@ -206,14 +212,22 @@ class ADNCEvaluator:
               - coef_dict: {gene: sum_abs_coef} for genes above threshold.
               - per_class_f1: {class_label_str: f1_score} for each class.
         """
-        model = LogisticRegression(
-            penalty=self._penalty,
+        # sklearn ≥1.8: 'penalty' is deprecated; use l1_ratio=1 for L1.
+        #              liblinear no longer handles multiclass natively →
+        #              wrap in OneVsRestClassifier.
+        # sklearn <1.8: use penalty='l1' directly; OvR wrapper still works.
+        common_kwargs = dict(
             solver=self._solver,
             C=self._C,
             class_weight=self._class_weight,
             max_iter=self._max_iter,
             random_state=self._random_state,
         )
+        if _SKLEARN_GE_18:
+            base_clf = LogisticRegression(l1_ratio=self._l1_ratio, **common_kwargs)
+        else:
+            base_clf = LogisticRegression(penalty="l1", **common_kwargs)
+        model = OneVsRestClassifier(base_clf)
         model.fit(X_scaled, y_labels)
         y_pred = model.predict(X_scaled)
 
@@ -229,9 +243,10 @@ class ADNCEvaluator:
             for cls, score in zip(model.classes_, per_class_scores)
         }
 
-        # Gene importance: sum |coef| across all OvR binary classifiers.
-        # model.coef_ has shape (n_classes, n_genes).
-        importance = np.sum(np.abs(model.coef_), axis=0)
+        # Gene importance: stack each binary classifier's |coef| then sum.
+        # Each estimator.coef_ has shape (1, n_genes) for liblinear.
+        coef_matrix = np.vstack([est.coef_ for est in model.estimators_])
+        importance = np.sum(np.abs(coef_matrix), axis=0)
         coef_dict: dict[str, float] = {
             gene: float(importance[i])
             for i, gene in enumerate(gene_names)

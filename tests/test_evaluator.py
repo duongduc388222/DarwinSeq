@@ -31,7 +31,7 @@ def _make_evaluator(tmp_path):
     cfg = {
         "model_type": "LogisticRegression",
         "target_col": "ADNC",
-        "penalty": "l1",
+        "l1_ratio": 1,
         "solver": "liblinear",
         "C": 1.0,
         "class_weight": "balanced",
@@ -96,7 +96,7 @@ def test_default_config_loads():
     """Default config file (config/model_params.json) loads without error."""
     ev = ADNCEvaluator()
     assert ev._C > 0
-    assert ev._penalty == "l1"
+    assert ev._l1_ratio == 1.0
 
 
 # ---------------------------------------------------------------------------
