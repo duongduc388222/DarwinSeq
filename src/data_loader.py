@@ -137,10 +137,22 @@ def safe_load(
         )
 
     # Build cleaned metadata AnnData.
+    # Content-based corruption (metadata/expression issues): isin removes ALL copies
+    # of that barcode, which is correct — a corrupted barcode is bad regardless of
+    # which copy it is.
+    # Duplicate barcodes: use positional dedup so only the *extra* copies are dropped
+    # and the first occurrence is preserved.
+    dup_bad_indices = {
+        idx for idx, entry in all_bad.items()
+        if "duplicate_barcode" in entry["reason"]
+    }
+    content_bad_indices = bad_indices - dup_bad_indices
     if bad_indices:
-        keep_mask = ~adata_meta.obs_names.isin(bad_indices)
+        content_drop = np.array(adata_meta.obs_names.isin(content_bad_indices))
+        dup_drop = np.array(adata_meta.obs_names.duplicated(keep="first"))
+        drop_mask = content_drop | dup_drop
         adata_clean = anndata.AnnData(
-            obs=obs[keep_mask.values],
+            obs=obs[~drop_mask],
             var=var,
         )
     else:
@@ -208,38 +220,37 @@ def _check_expression_corruption(
         rng = np.random.default_rng(seed=42)
         sampled_rows = np.sort(rng.choice(n_cells, size=sample_size, replace=False))
 
-        # Group sampled rows into contiguous chunks for efficient h5py slicing.
-        for chunk_start_idx in range(0, len(sampled_rows), _EXPR_CHUNK_SIZE):
-            chunk_rows = sampled_rows[chunk_start_idx: chunk_start_idx + _EXPR_CHUNK_SIZE]
+        # Check each sampled row for NaN, Inf, and negative values independently.
+        # Using separate `if` statements (not elif) so a cell flagged for multiple
+        # corruption types is reported for each — all reasons are recorded.
+        for r in sampled_rows:
+            ds = int(indptr[r])
+            de = int(indptr[r + 1])
+            if ds == de:
+                continue  # already caught by all-zero check
+            values = f["X/data"][ds:de]
 
-            for r in chunk_rows:
-                ds = int(indptr[r])
-                de = int(indptr[r + 1])
-                if ds == de:
-                    continue  # already caught by all-zero check
-                values = f["X/data"][ds:de]
-
-                if np.any(np.isnan(values)):
-                    count = int(np.sum(np.isnan(values)))
-                    bad.append({
-                        "index": obs_names[r],
-                        "reason": "nan_in_expression",
-                        "details": f"{count} NaN value(s) in expression vector",
-                    })
-                elif np.any(np.isinf(values)):
-                    count = int(np.sum(np.isinf(values)))
-                    bad.append({
-                        "index": obs_names[r],
-                        "reason": "inf_in_expression",
-                        "details": f"{count} Inf value(s) in expression vector",
-                    })
-                elif np.any(values < 0):
-                    count = int(np.sum(values < 0))
-                    bad.append({
-                        "index": obs_names[r],
-                        "reason": "negative_expression",
-                        "details": f"{count} negative value(s) in expression vector",
-                    })
+            if np.any(np.isnan(values)):
+                count = int(np.sum(np.isnan(values)))
+                bad.append({
+                    "index": obs_names[r],
+                    "reason": "nan_in_expression",
+                    "details": f"{count} NaN value(s) in expression vector",
+                })
+            if np.any(np.isinf(values)):
+                count = int(np.sum(np.isinf(values)))
+                bad.append({
+                    "index": obs_names[r],
+                    "reason": "inf_in_expression",
+                    "details": f"{count} Inf value(s) in expression vector",
+                })
+            if np.any(values < 0):
+                count = int(np.sum(values < 0))
+                bad.append({
+                    "index": obs_names[r],
+                    "reason": "negative_expression",
+                    "details": f"{count} negative value(s) in expression vector",
+                })
 
     return bad
 
@@ -399,8 +410,17 @@ class DataLoader:
                 if ds == de:
                     continue  # all-zero row
 
-                row_cols = f["X/indices"][ds:de]  # sorted within CSR row
+                row_cols = f["X/indices"][ds:de]
                 row_vals = f["X/data"][ds:de]
+
+                # searchsorted requires sorted column indices. Standard CSR
+                # (scipy/h5ad) guarantees this, but guard defensively in case
+                # the file was written with unsorted indices (would produce
+                # silently wrong expression values otherwise).
+                if len(row_cols) > 1 and not np.all(row_cols[:-1] <= row_cols[1:]):
+                    sort_order = np.argsort(row_cols)
+                    row_cols = row_cols[sort_order]
+                    row_vals = row_vals[sort_order]
 
                 # Vectorised binary-search for all requested gene columns.
                 # Clip pos before indexing: np.searchsorted can return
@@ -430,12 +450,12 @@ class DataLoader:
             Missing columns are silently excluded.
         """
         present = [c for c in _PATHOLOGY_COLS if c in self.adata.obs.columns]
-        obs_sub = (
-            self.adata.obs.loc[cell_barcodes, present]
-            if cell_barcodes is not None
-            else self.adata.obs[present]
-        )
-        return obs_sub.copy()
+        if cell_barcodes is not None:
+            missing = [bc for bc in cell_barcodes if bc not in self.adata.obs.index]
+            if missing:
+                raise KeyError(f"Barcode(s) not found in adata: {missing[:5]}")
+            return self.adata.obs.loc[cell_barcodes, present].copy()
+        return self.adata.obs[present].copy()
 
     def get_metadata(
         self,
@@ -452,5 +472,8 @@ class DataLoader:
             Full obs DataFrame (or subset for requested barcodes).
         """
         if cell_barcodes is not None:
+            missing = [bc for bc in cell_barcodes if bc not in self.adata.obs.index]
+            if missing:
+                raise KeyError(f"Barcode(s) not found in adata: {missing[:5]}")
             return self.adata.obs.loc[cell_barcodes].copy()
         return self.adata.obs.copy()
