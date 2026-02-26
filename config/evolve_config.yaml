@@ -12,6 +12,7 @@ evolution:
   num_islands: 1            # Single island (parallel islands require more API budget)
   checkpoint_interval: 1    # Save checkpoint after every generation
   random_seed: 42
+  diff_based_evolution: false  # Use full rewrite; Gemini does not reliably produce SEARCH/REPLACE diffs
 
 # ── LLM configuration ────────────────────────────────────────────────────────
 llm:
