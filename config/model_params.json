@@ -11,5 +11,6 @@
   "scaler": "StandardScaler",
   "scoring_metric": "balanced_accuracy",
   "secondary_metric": "macro_f1",
-  "coef_threshold": 1e-10
+  "coef_threshold": 1e-10,
+  "cv_n_splits": 5
 }

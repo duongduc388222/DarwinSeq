@@ -102,6 +102,29 @@ class FakeDataLoader:
             return obs.loc[cell_barcodes].copy()
         return obs.copy()
 
+    def get_adnc_target(
+        self, cell_barcodes: list[str] | None = None
+    ) -> pd.Series:
+        """Return ADNC ordinal labels (0–3) as a float Series for requested barcodes."""
+        all_barcodes = list(self.adata.obs_names)
+        rng = np.random.default_rng(0)
+        labels = rng.integers(0, 4, size=self.n_cells).astype(float)
+        label_series = pd.Series(labels, index=all_barcodes, name="ADNC")
+        if cell_barcodes is not None:
+            return label_series.loc[cell_barcodes]
+        return label_series
+
+    def get_donor_ids(
+        self, cell_barcodes: list[str] | None = None
+    ) -> pd.Series:
+        """Return Donor ID strings for requested barcodes."""
+        all_barcodes = list(self.adata.obs_names)
+        donors = [f"DONOR_{i % 80:03d}" for i in range(self.n_cells)]
+        series = pd.Series(donors, index=all_barcodes, name="Donor ID")
+        if cell_barcodes is not None:
+            return series.loc[cell_barcodes].copy()
+        return series.copy()
+
 
 class FakeVocab:
     """
@@ -117,20 +140,22 @@ def _make_evaluator(n_cells: int = 100):
     Return a GeneSelectorEvaluator pre-loaded with fake components.
 
     Bypasses _ensure_loaded so no real h5ad file is needed.
+    Skips automatically if openevolve is not installed.
     """
-    from src.evaluator import LASSOEvaluator
+    pytest.importorskip("openevolve", reason="openevolve not installed")
+    from src.evaluator import ADNCEvaluator
     from src.openevolve_adapter import GeneSelectorEvaluator
 
     loader = FakeDataLoader()
     # in-vocab: first 150 genes; out-of-vocab: remaining 150
     in_vocab = [f"GENE_{i}" for i in range(150)]
     vocab = FakeVocab(in_vocab)
-    lasso = LASSOEvaluator()
+    adnc_evaluator = ADNCEvaluator()
 
     evaluator = GeneSelectorEvaluator(n_cells=n_cells)
     evaluator._data_loader = loader
     evaluator._vocab = vocab
-    evaluator._evaluator = lasso
+    evaluator._evaluator = adnc_evaluator
     return evaluator
 
 
@@ -468,21 +493,24 @@ class TestBuildSuggestions:
         self,
         retained: list[str],
         coefficients: dict,
-        scores: dict | None = None,
+        per_class_f1: dict | None = None,
     ):
-        """Return a minimal EvalResult-like object."""
+        """Return a minimal EvalResult-like object using the ADNC API."""
         from src.evaluator import EvalResult
 
         return EvalResult(
-            scores=scores or {f"target_{i}": 0.3 for i in range(6)},
+            balanced_accuracy=0.3,
+            macro_f1=0.3,
             aggregate_score=0.3,
             retained_genes=retained,
             coefficients=coefficients,
             n_retained=len(retained),
+            per_class_f1=per_class_f1 or {"0": 0.3, "1": 0.2, "2": 0.4, "3": 0.3},
         )
 
     def test_returns_list_of_strings(self):
         """_build_suggestions must return a list of non-empty strings."""
+        pytest.importorskip("openevolve", reason="openevolve not installed")
         from src.openevolve_adapter import _build_suggestions
 
         selected = [f"GENE_{i}" for i in range(200)]
@@ -498,6 +526,7 @@ class TestBuildSuggestions:
 
     def test_mentions_retention_stats(self):
         """Suggestions should mention the number of retained genes."""
+        pytest.importorskip("openevolve", reason="openevolve not installed")
         from src.openevolve_adapter import _build_suggestions
 
         selected = [f"GENE_{i}" for i in range(200)]
@@ -511,6 +540,7 @@ class TestBuildSuggestions:
 
     def test_zeroed_genes_mentioned(self):
         """Suggestions should list example zeroed genes."""
+        pytest.importorskip("openevolve", reason="openevolve not installed")
         from src.openevolve_adapter import _build_suggestions
 
         selected = [f"GENE_{i}" for i in range(200)]

@@ -101,6 +101,15 @@ class FakeDataLoader:
             return series.loc[cell_barcodes].copy()
         return series.copy()
 
+    def get_donor_ids(
+        self, cell_barcodes: list[str] | None = None
+    ) -> pd.Series:
+        """Return Donor ID strings for requested barcodes."""
+        series = self.adata.obs["Donor ID"]
+        if cell_barcodes is not None:
+            return series.loc[cell_barcodes].copy()
+        return series.copy()
+
     def get_pathology_targets(
         self, cell_barcodes: list[str] | None = None
     ) -> pd.DataFrame:
@@ -141,11 +150,11 @@ def test_sample_x_shape(loader, gene_list):
 
 
 def test_sample_y_shape(loader, gene_list):
-    """y (adnc mode) should be (100, 1) with column 'ADNC'."""
+    """y (adnc mode) should be (100, 2) with columns ['ADNC', 'Donor ID']."""
     sampler = CellSampler(loader, gene_list, seed=42)
     _, y = sampler.sample(n=100)
-    assert y.shape == (100, 1)
-    assert list(y.columns) == ["ADNC"]
+    assert y.shape == (100, 2)
+    assert list(y.columns) == ["ADNC", "Donor ID"]
 
 
 def test_sample_x_columns_match_gene_list(loader, gene_list):
@@ -270,7 +279,7 @@ def test_small_n_works(loader, gene_list):
     sampler = CellSampler(loader, gene_list, seed=0)
     X, y = sampler.sample(n=1)
     assert X.shape == (1, 200)
-    assert y.shape == (1, 1)  # adnc mode: single 'ADNC' column
+    assert y.shape == (1, 2)  # adnc mode: ['ADNC', 'Donor ID']
 
 
 def test_n_equals_all_cells(loader, gene_list):

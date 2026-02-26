@@ -28,11 +28,11 @@ class CellSampler:
     Args:
         data_loader: A DataLoader instance (or any object with the same
                      interface: .adata.obs_names, .get_expression_for_cells(),
-                     .get_adnc_target(), .get_pathology_targets()).
+                     .get_adnc_target(), .get_donor_ids(), .get_pathology_targets()).
         gene_list: Ordered list of gene symbols to extract expression for.
         seed: Random seed for reproducibility. None means non-deterministic.
         target: Which target to return with y.
-                "adnc"      — ADNC ordinal class (default); y has one column.
+                "adnc"      — ADNC class + Donor ID (default); y has 2 columns.
                 "pathology" — legacy 6-column continuous pathology targets.
     """
 
@@ -69,7 +69,10 @@ class CellSampler:
             X: DataFrame of shape (n, len(gene_list)) with float32 expression
                values. Index is cell barcodes, columns are gene_list.
             y: DataFrame whose content depends on self.target:
-                 - "adnc"      → shape (n, 1), column "ADNC", float (0–3 or NaN).
+                 - "adnc"      → shape (n, 2), columns ["ADNC", "Donor ID"].
+                                 ADNC values are float (0–3 or NaN); Donor ID
+                                 values are strings. Donor ID is passed to the
+                                 evaluator for GroupKFold cross-validation.
                  - "pathology" → shape (n, 6), one column per pathology target.
                Index matches X. Values may be NaN where data is missing.
 
@@ -91,7 +94,12 @@ class CellSampler:
         X = self.data_loader.get_expression_for_cells(barcodes, self.gene_list)
 
         if self.target == "adnc":
-            y = self.data_loader.get_adnc_target(barcodes).to_frame()
+            adnc = self.data_loader.get_adnc_target(barcodes)
+            donor_ids = self.data_loader.get_donor_ids(barcodes)
+            y = pd.DataFrame(
+                {"ADNC": adnc.values, "Donor ID": donor_ids.values},
+                index=barcodes,
+            )
         else:
             y = self.data_loader.get_pathology_targets(barcodes)
 

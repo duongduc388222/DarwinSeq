@@ -41,6 +41,7 @@ def _make_evaluator(tmp_path):
         "scoring_metric": "balanced_accuracy",
         "secondary_metric": "macro_f1",
         "coef_threshold": 1e-10,
+        "cv_n_splits": 5,
     }
     cfg_path = tmp_path / "model_params.json"
     cfg_path.write_text(json.dumps(cfg))
@@ -62,7 +63,8 @@ def _make_4class_data(n_per_class=30, n_genes=50, seed=0):
     Returns:
         Tuple of:
           - X: DataFrame of shape (n_per_class * 4, n_genes).
-          - y: Single-column DataFrame with column "ADNC" containing integers 0–3.
+          - y: DataFrame with columns ["ADNC", "Donor ID"]. ADNC contains
+               integers 0–3; Donor ID is unique per sample (one cell per donor).
     """
     rng = np.random.default_rng(seed)
     n_total = n_per_class * 4
@@ -77,7 +79,10 @@ def _make_4class_data(n_per_class=30, n_genes=50, seed=0):
 
     gene_cols = [f"gene_{i}" for i in range(n_genes)]
     X = pd.DataFrame(X_vals, columns=gene_cols)
-    y = pd.DataFrame({"ADNC": y_vals.astype(float)})
+    y = pd.DataFrame({
+        "ADNC": y_vals.astype(float),
+        "Donor ID": [f"DONOR_{i}" for i in range(n_total)],
+    })
     return X, y
 
 
@@ -158,7 +163,10 @@ def test_degenerate_single_class(tmp_path):
     ev = _make_evaluator(tmp_path)
     n = 40
     X = pd.DataFrame(np.random.randn(n, 10), columns=[f"g{i}" for i in range(10)])
-    y = pd.DataFrame({"ADNC": np.zeros(n)})  # only class 0
+    y = pd.DataFrame({
+        "ADNC": np.zeros(n),
+        "Donor ID": [f"D{i}" for i in range(n)],
+    })
     result = ev.evaluate(X, y)
     assert result.balanced_accuracy == 0.0
     assert result.macro_f1 == 0.0
@@ -175,7 +183,10 @@ def test_all_nan_returns_zero(tmp_path):
     ev = _make_evaluator(tmp_path)
     n = 40
     X = pd.DataFrame(np.random.randn(n, 10), columns=[f"g{i}" for i in range(10)])
-    y = pd.DataFrame({"ADNC": [float("nan")] * n})
+    y = pd.DataFrame({
+        "ADNC": [float("nan")] * n,
+        "Donor ID": [f"D{i}" for i in range(n)],
+    })
     result = ev.evaluate(X, y)
     assert result.balanced_accuracy == 0.0
     assert result.retained_genes == []
@@ -194,9 +205,9 @@ def test_nan_rows_dropped(tmp_path):
     """
     ev = _make_evaluator(tmp_path)
     X, y = _make_4class_data(n_per_class=30, n_genes=50)
-    # Zero out half the labels.
+    # Zero out half the ADNC labels.
     y_partial = y.copy()
-    y_partial.iloc[: len(y) // 2, 0] = float("nan")
+    y_partial.loc[y_partial.index[: len(y) // 2], "ADNC"] = float("nan")
     # Should not raise; should still produce a result.
     result = ev.evaluate(X, y_partial)
     assert isinstance(result.balanced_accuracy, float)
@@ -292,7 +303,36 @@ def test_per_class_f1_keys(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 14. EvalResult is a plain dataclass (constructable directly)
+# 14. CV score is sub-1.0 (sanity check for no in-sample leakage)
+# ---------------------------------------------------------------------------
+
+
+def test_cv_score_not_trivially_one(tmp_path):
+    """
+    CV balanced accuracy must be < 1.0 for pure-noise features.
+
+    With no signal genes and one unique donor per sample, the classifier
+    cannot generalise beyond the training fold — score should be near chance
+    (0.25 for 4 classes).
+    """
+    ev = _make_evaluator(tmp_path)
+    rng = np.random.default_rng(0)
+    n = 80
+    X = pd.DataFrame(
+        rng.standard_normal((n, 20)), columns=[f"g{i}" for i in range(20)]
+    )
+    y = pd.DataFrame({
+        "ADNC": [float(i % 4) for i in range(n)],
+        "Donor ID": [f"D{i}" for i in range(n)],
+    })
+    result = ev.evaluate(X, y)
+    assert result.balanced_accuracy < 1.0, (
+        f"Expected CV score < 1.0 (no signal), got {result.balanced_accuracy:.4f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 15. EvalResult is a plain dataclass (constructable directly)
 # ---------------------------------------------------------------------------
 
 

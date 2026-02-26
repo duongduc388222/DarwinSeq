@@ -43,9 +43,11 @@ class GenerationResult:
 
     Attributes:
         generation_id: Zero-based generation index.
-        best_score: Aggregate Pearson r of the best individual in this generation.
+        best_score: Aggregate balanced accuracy of the best individual in this generation.
         best_genes: The 200-gene list selected by the best individual.
         retained_genes: Genes with non-zero LASSO coefficient in the best individual.
+        coefficients: Gene → summed absolute LASSO coefficient for the best individual.
+                      Empty dict if coefficients were not recorded.
         all_scores: Aggregate scores for all evaluated individuals this generation.
         timestamp: ISO 8601 UTC timestamp when the generation completed.
     """
@@ -54,6 +56,7 @@ class GenerationResult:
     best_score: float
     best_genes: list = field(default_factory=list)
     retained_genes: list = field(default_factory=list)
+    coefficients: dict = field(default_factory=dict)
     all_scores: list = field(default_factory=list)
     timestamp: str = ""
 
@@ -134,7 +137,11 @@ class EvolutionRunner:
         """
         Persist a GenerationResult to disk as JSON.
 
-        Creates results/evolution/gen_{gen_id}/ and writes result.json inside it.
+        Creates results/evolution/gen_{gen_id}/ and writes three files:
+          - result.json: Full GenerationResult serialized as dict.
+          - selected_genes.json: The 200-gene list from result.best_genes.
+          - eval_result.json: Compact evaluation summary with aggregate_score,
+            retained_genes, coefficients, and n_retained.
 
         Args:
             gen_id: Generation index (used for the directory name).
@@ -143,11 +150,31 @@ class EvolutionRunner:
         gen_dir = self._output_dir / f"gen_{gen_id}"
         gen_dir.mkdir(parents=True, exist_ok=True)
 
+        # Full result (all fields)
         out_path = gen_dir / "result.json"
         with open(out_path, "w") as fh:
             json.dump(asdict(result), fh, indent=2)
 
-        logger.info("Generation %d logged to %s", gen_id, out_path)
+        # Selected genes list (for easy loading by analysis module)
+        selected_path = gen_dir / "selected_genes.json"
+        with open(selected_path, "w") as fh:
+            json.dump(result.best_genes, fh, indent=2)
+
+        # Compact evaluation summary
+        eval_path = gen_dir / "eval_result.json"
+        with open(eval_path, "w") as fh:
+            json.dump(
+                {
+                    "aggregate_score": result.best_score,
+                    "retained_genes": result.retained_genes,
+                    "coefficients": result.coefficients,
+                    "n_retained": len(result.retained_genes),
+                },
+                fh,
+                indent=2,
+            )
+
+        logger.info("Generation %d logged to %s", gen_id, gen_dir)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Private helpers
@@ -216,16 +243,16 @@ class EvolutionRunner:
         if not results:
             try:
                 best = evolver.get_best_individual()
+                best_artifacts = getattr(best, "artifacts", {}) or {}
+                raw_coefs = best_artifacts.get("coefficients", {})
+                coefs = {k: float(v) for k, v in raw_coefs.items()} if isinstance(raw_coefs, dict) else {}
                 results.append(
                     GenerationResult(
                         generation_id=0,
                         best_score=float(getattr(best, "fitness", 0.0)),
-                        best_genes=list(
-                            getattr(best, "artifacts", {}).get("selected_genes", [])
-                        ),
-                        retained_genes=list(
-                            getattr(best, "artifacts", {}).get("retained_genes", [])
-                        ),
+                        best_genes=list(best_artifacts.get("selected_genes", [])),
+                        retained_genes=list(best_artifacts.get("retained_genes", [])),
+                        coefficients=coefs,
                         all_scores=[float(getattr(best, "fitness", 0.0))],
                         timestamp=_utc_now(),
                     )
@@ -303,11 +330,15 @@ def _parse_checkpoint(gen_id: int, checkpoint_path: Path) -> GenerationResult:
         for ind in all_individuals
     ]
 
+    raw_coefs = artifacts.get("coefficients", {})
+    coefficients = {k: float(v) for k, v in raw_coefs.items()} if isinstance(raw_coefs, dict) else {}
+
     return GenerationResult(
         generation_id=gen_id,
         best_score=fitness,
         best_genes=list(artifacts.get("selected_genes", [])),
         retained_genes=list(artifacts.get("retained_genes", [])),
+        coefficients=coefficients,
         all_scores=all_scores,
         timestamp=data.get("timestamp") or _utc_now(),
     )

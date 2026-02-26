@@ -53,8 +53,11 @@ _PATHOLOGY_COLS = [
 _ADNC_COL = "ADNC"
 ADNC_LABEL_ORDER: list[str] = ["Not AD", "Low", "Intermediate", "High"]
 
+# Donor identifier column (donor-level label used for GroupKFold CV).
+_DONOR_COL = "Donor ID"
+
 # Metadata columns that must not be NaN for a sample to be usable.
-_REQUIRED_META_COLS = ["Donor ID"]
+_REQUIRED_META_COLS = [_DONOR_COL]
 
 # Maximum tolerated corruption rate before aborting.
 _MAX_DROP_RATE = 0.05
@@ -538,3 +541,38 @@ class DataLoader:
             return label_to_int[key]
 
         return raw.map(_encode).rename("ADNC")
+
+    def get_donor_ids(
+        self,
+        cell_barcodes: list[str] | None = None,
+    ) -> "pd.Series":
+        """
+        Return donor IDs for given cell barcodes as a string Series.
+
+        Donor IDs are donor-level identifiers stored in obs under the
+        column _DONOR_COL ("Donor ID"). They are used as group labels for
+        GroupKFold cross-validation in the evaluator to prevent data leakage
+        between donors sharing the same ADNC class.
+
+        Args:
+            cell_barcodes: If provided, return only rows for these barcodes.
+                           If None, return all cells.
+
+        Returns:
+            pd.Series named "Donor ID" with string donor identifiers.
+
+        Raises:
+            KeyError: If the Donor ID column is absent in adata.obs, or if
+                      any requested barcode is not found.
+        """
+        if _DONOR_COL not in self.adata.obs.columns:
+            raise KeyError(
+                f"Column '{_DONOR_COL}' not found in adata.obs. "
+                f"Available columns: {list(self.adata.obs.columns[:10])}"
+            )
+        if cell_barcodes is not None:
+            missing = [bc for bc in cell_barcodes if bc not in self.adata.obs.index]
+            if missing:
+                raise KeyError(f"Barcode(s) not found in adata: {missing[:5]}")
+            return self.adata.obs.loc[cell_barcodes, _DONOR_COL].copy()
+        return self.adata.obs[_DONOR_COL].copy()

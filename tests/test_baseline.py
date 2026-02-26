@@ -19,7 +19,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts.run_baseline import compute_summary, run_single_seed, select_best_run
-from src.evaluator import LASSOEvaluator, DEFAULT_CONFIG_PATH
+from src.evaluator import ADNCEvaluator as LASSOEvaluator, DEFAULT_CONFIG_PATH
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +83,27 @@ class FakeDataLoader:
             return obs.loc[cell_barcodes].copy()
         return obs.copy()
 
+    def get_adnc_target(
+        self, cell_barcodes: list[str] | None = None
+    ) -> pd.Series:
+        """Return ADNC ordinal labels (0–3) as a float Series for requested barcodes."""
+        all_barcodes = list(self.adata.obs_names)
+        rng = np.random.default_rng(0)
+        labels = rng.integers(0, 4, size=self.n_cells).astype(float)
+        label_series = pd.Series(labels, index=all_barcodes, name="ADNC")
+        if cell_barcodes is not None:
+            return label_series.loc[cell_barcodes]
+        return label_series
+
+    def get_donor_ids(
+        self, cell_barcodes: list[str] | None = None
+    ) -> pd.Series:
+        """Return Donor ID strings for requested barcodes."""
+        series = self.adata.obs["Donor ID"]
+        if cell_barcodes is not None:
+            return series.loc[cell_barcodes].copy()
+        return series.copy()
+
 
 class FakeVocab:
     """
@@ -135,7 +156,7 @@ def evaluator():
 def test_run_single_seed_required_keys(loader, vocab, evaluator):
     """Result dict must contain all required keys."""
     result = run_single_seed(loader, vocab, evaluator, seed=0, n_in=10, n_out=10, n_cells=50)
-    required = {"seed", "gene_list", "scores", "aggregate_score", "retained_genes", "n_retained"}
+    required = {"seed", "gene_list", "balanced_accuracy", "aggregate_score", "retained_genes", "n_retained"}
     assert required.issubset(result.keys())
 
 
@@ -192,7 +213,9 @@ def _make_runs(n: int, base_score: float = 0.5) -> list[dict]:
         runs.append({
             "seed": i,
             "gene_list": [f"GENE_{i * 10 + j}" for j in range(20)],
-            "scores": {"t1": base_score + i * 0.01},
+            "balanced_accuracy": base_score + i * 0.01,
+            "macro_f1": base_score + i * 0.01,
+            "per_class_f1": {"0": 0.3, "1": 0.3, "2": 0.3, "3": 0.3},
             "aggregate_score": base_score + i * 0.01,
             "retained_genes": [f"GENE_{i * 10}", f"GENE_{i * 10 + 1}"],
             "n_retained": 2,
@@ -205,8 +228,8 @@ def test_compute_summary_required_keys():
     runs = _make_runs(5)
     summary = compute_summary(runs)
     required = {
-        "n_runs", "aggregate_score_mean", "aggregate_score_std",
-        "aggregate_score_min", "aggregate_score_max",
+        "n_runs", "balanced_accuracy_mean", "balanced_accuracy_std",
+        "balanced_accuracy_min", "balanced_accuracy_max",
         "gene_frequency", "retained_count_distribution",
     }
     assert required.issubset(summary.keys())
@@ -219,10 +242,10 @@ def test_compute_summary_n_runs():
 
 
 def test_compute_summary_mean_is_correct():
-    """aggregate_score_mean must match numpy mean of aggregate scores."""
+    """balanced_accuracy_mean must match numpy mean of balanced accuracies."""
     runs = _make_runs(5)
-    scores = [r["aggregate_score"] for r in runs]
-    assert compute_summary(runs)["aggregate_score_mean"] == pytest.approx(np.mean(scores))
+    scores = [r["balanced_accuracy"] for r in runs]
+    assert compute_summary(runs)["balanced_accuracy_mean"] == pytest.approx(np.mean(scores))
 
 
 def test_compute_summary_retained_count_distribution_length():
@@ -246,7 +269,7 @@ def test_compute_summary_empty_runs():
     assert summary["gene_frequency"] == {}
     assert summary["retained_count_distribution"] == []
     import math
-    assert math.isnan(summary["aggregate_score_mean"])
+    assert math.isnan(summary["balanced_accuracy_mean"])
 
 
 # ---------------------------------------------------------------------------

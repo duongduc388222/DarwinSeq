@@ -22,6 +22,7 @@ import pandas as pd
 import sklearn
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import balanced_accuracy_score, f1_score
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 from sklearn.multiclass import OneVsRestClassifier
 from sklearn.preprocessing import StandardScaler
 
@@ -92,6 +93,7 @@ class ADNCEvaluator:
         self._max_iter: int = int(self._params["max_iter"])
         self._random_state: int = int(self._params["random_state"])
         self._coef_threshold: float = float(self._params["coef_threshold"])
+        self._cv_n_splits: int = int(self._params["cv_n_splits"])
 
     # ------------------------------------------------------------------
     # Public API
@@ -99,16 +101,24 @@ class ADNCEvaluator:
 
     def evaluate(self, X: pd.DataFrame, y: pd.DataFrame) -> EvalResult:
         """
-        Train L1 logistic regression on X predicting ADNC class in y.
+        Evaluate ADNC classification via donor-aware cross-validation.
 
-        y must have a single column (named "ADNC" by convention) containing
-        integer-encoded ADNC labels (0=Not AD, 1=Low, 2=Intermediate, 3=High).
-        Rows where y is NaN are silently dropped before fitting.
+        y should contain an "ADNC" column (integer labels 0–3 or NaN) and
+        optionally a "Donor ID" column.  When "Donor ID" is present,
+        StratifiedGroupKFold is used so all cells from a given donor fall
+        entirely in train or test — preventing the label-leakage that
+        arises because ADNC is a donor-level label.  If "Donor ID" is absent,
+        StratifiedKFold is used as a fallback.
+
+        Balanced accuracy and per-class F1 are averaged across CV folds
+        (honest held-out estimates).  A separate full-data fit is run
+        afterwards to extract gene importance coefficients for LLM feedback.
 
         Args:
             X: Feature matrix, shape (n_cells, n_genes). Index must align
                with y's index.
-            y: Single-column DataFrame with ADNC integer labels (or NaN).
+            y: DataFrame with at least an "ADNC" column.  May also contain
+               "Donor ID" for group-aware CV.
 
         Returns:
             EvalResult with balanced_accuracy, macro_f1, retained_genes,
@@ -125,9 +135,13 @@ class ADNCEvaluator:
         if X.empty or y.empty:
             return EvalResult()
 
+        # Extract ADNC labels and optional donor groups.
+        adnc_col = "ADNC" if "ADNC" in y.columns else y.columns[0]
+        donor_col = "Donor ID" if "Donor ID" in y.columns else None
+        y_col = y[adnc_col]
+        groups = y[donor_col].values if donor_col else None
+
         # Drop NaN-labelled rows.
-        target_col = y.columns[0]
-        y_col = y[target_col]
         valid_mask = y_col.notna()
         n_valid = int(valid_mask.sum())
 
@@ -145,23 +159,26 @@ class ADNCEvaluator:
             )
             return EvalResult()
 
+        groups_fit = groups[valid_mask.values] if groups is not None else None
         gene_names = list(X.columns)
         X_scaled, _ = self._preprocess(X, y)
         X_fit = X_scaled[valid_mask.values]
 
-        bal_acc, macro_f1, coef_dict, per_class_f1 = self._train_and_score(
-            X_fit, y_labels, gene_names
+        # CV for honest score; full-data fit for gene importance feedback.
+        cv_bal_acc, cv_macro_f1, cv_per_class_f1 = self._cross_validate(
+            X_fit, y_labels, groups_fit
         )
+        _, _, coef_dict, _ = self._train_and_score(X_fit, y_labels, gene_names)
 
         retained_genes = sorted(coef_dict.keys())
         return EvalResult(
-            balanced_accuracy=bal_acc,
-            macro_f1=macro_f1,
-            aggregate_score=bal_acc,
+            balanced_accuracy=cv_bal_acc,
+            macro_f1=cv_macro_f1,
+            aggregate_score=cv_bal_acc,
             retained_genes=retained_genes,
             coefficients=coef_dict,
             n_retained=len(retained_genes),
-            per_class_f1=per_class_f1,
+            per_class_f1=cv_per_class_f1,
         )
 
     # ------------------------------------------------------------------
@@ -189,6 +206,90 @@ class ADNCEvaluator:
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X.values.astype(float))
         return X_scaled, y
+
+    def _cross_validate(
+        self,
+        X_scaled: np.ndarray,
+        y_labels: np.ndarray,
+        groups: np.ndarray | None,
+    ) -> tuple[float, float, dict[str, float]]:
+        """
+        Run StratifiedGroupKFold CV (or StratifiedKFold if groups is None).
+
+        The number of splits is capped at min(cv_n_splits, n_unique_groups)
+        to avoid empty folds when few donors are represented.
+
+        Args:
+            X_scaled: Scaled feature matrix (n_valid_cells, n_genes).
+            y_labels: 1-D integer label array (n_valid_cells,), no NaNs.
+            groups: 1-D array of donor IDs (n_valid_cells,), or None.
+
+        Returns:
+            Tuple of:
+              - mean_balanced_accuracy: float averaged across CV folds.
+              - mean_macro_f1: float averaged across CV folds.
+              - per_class_f1: {class_label_str: mean_f1} averaged over folds.
+        """
+        if groups is not None:
+            n_unique = len(np.unique(groups))
+            n_splits = min(self._cv_n_splits, n_unique)
+            cv = StratifiedGroupKFold(n_splits=n_splits)
+            split_iter = cv.split(X_scaled, y_labels, groups)
+        else:
+            n_splits = self._cv_n_splits
+            cv = StratifiedKFold(
+                n_splits=n_splits, shuffle=True, random_state=self._random_state
+            )
+            split_iter = cv.split(X_scaled, y_labels)
+
+        if n_splits < 2:
+            return 0.0, 0.0, {}
+
+        all_classes = sorted(np.unique(y_labels))
+        fold_bal_accs: list[float] = []
+        fold_macro_f1s: list[float] = []
+        fold_per_class: dict[str, list[float]] = {str(c): [] for c in all_classes}
+
+        common_kwargs = dict(
+            solver=self._solver,
+            C=self._C,
+            class_weight=self._class_weight,
+            max_iter=self._max_iter,
+            random_state=self._random_state,
+        )
+
+        for train_idx, test_idx in split_iter:
+            if _SKLEARN_GE_18:
+                base_clf = LogisticRegression(
+                    l1_ratio=self._l1_ratio, **common_kwargs
+                )
+            else:
+                base_clf = LogisticRegression(penalty="l1", **common_kwargs)
+            fold_model = OneVsRestClassifier(base_clf)
+            fold_model.fit(X_scaled[train_idx], y_labels[train_idx])
+            y_pred = fold_model.predict(X_scaled[test_idx])
+            y_true = y_labels[test_idx]
+
+            fold_bal_accs.append(float(balanced_accuracy_score(y_true, y_pred)))
+            fold_macro_f1s.append(float(
+                f1_score(y_true, y_pred, average="macro", zero_division=0)
+            ))
+            per_class_scores = f1_score(
+                y_true, y_pred, average=None,
+                labels=all_classes, zero_division=0,
+            )
+            for cls, score in zip(all_classes, per_class_scores):
+                fold_per_class[str(cls)].append(float(score))
+
+        mean_per_class = {
+            cls: float(np.mean(scores))
+            for cls, scores in fold_per_class.items()
+        }
+        return (
+            float(np.mean(fold_bal_accs)),
+            float(np.mean(fold_macro_f1s)),
+            mean_per_class,
+        )
 
     def _train_and_score(
         self,
