@@ -9,16 +9,21 @@ Options:
     --n_generations N         Number of generations to run  [default: 5]
     --output_dir DIR          Directory for evolution output  [default: results/evolution]
     --baseline_score SCORE    Baseline aggregate score for comparison  [default: None]
+    --data_path PATH          Path to the SEAAD A9 .h5ad file  [default: value in src/data_loader.py]
+    --vocab_path PATH         Path to gene_vocabulary.txt  [default: config/gene_vocabulary.txt]
 
 Requires openevolve to be installed:
     pip install openevolve>=0.2.0
 
 Environment:
-    OPENAI_API_KEY — Gemini API key (loaded from .env automatically by src/evolve.py)
+    OPENAI_API_KEY       — Gemini API key (loaded from .env automatically by src/evolve.py)
+    DARWINSEQ_DATA_PATH  — Override data path (set automatically from --data_path)
+    DARWINSEQ_VOCAB_PATH — Override vocab path (set automatically from --vocab_path)
 """
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -37,7 +42,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         argv: Argument list (defaults to sys.argv[1:]).
 
     Returns:
-        Namespace with attributes: config, n_generations, output_dir, baseline_score.
+        Namespace with attributes: config, n_generations, output_dir, baseline_score,
+        data_path, vocab_path.
     """
     parser = argparse.ArgumentParser(
         description="Run OpenEvolve gene selection evolution for DarwinSeq.",
@@ -64,6 +70,24 @@ def parse_args(argv=None) -> argparse.Namespace:
         type=float,
         default=None,
         help="Random-baseline aggregate score for comparison in summary",
+    )
+    parser.add_argument(
+        "--data_path",
+        default=None,
+        help=(
+            "Path to the SEAAD A9 .h5ad file. "
+            "Overrides the default in src/data_loader.py and the "
+            "DARWINSEQ_DATA_PATH environment variable."
+        ),
+    )
+    parser.add_argument(
+        "--vocab_path",
+        default=None,
+        help=(
+            "Path to gene_vocabulary.txt. "
+            "Overrides the default config/gene_vocabulary.txt and the "
+            "DARWINSEQ_VOCAB_PATH environment variable."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -131,12 +155,23 @@ def main(argv=None) -> None:
 
     _ensure_openevolve()
 
+    # Export data/vocab paths as env vars so the evaluator adapter (imported
+    # dynamically by OpenEvolve) can pick them up via _get_singleton_evaluator().
+    if args.data_path:
+        os.environ["DARWINSEQ_DATA_PATH"] = args.data_path
+    if args.vocab_path:
+        os.environ["DARWINSEQ_VOCAB_PATH"] = args.vocab_path
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Config:      {args.config}")
     print(f"Generations: {args.n_generations}")
     print(f"Output dir:  {output_dir}")
+    if args.data_path:
+        print(f"Data path:   {args.data_path}")
+    if args.vocab_path:
+        print(f"Vocab path:  {args.vocab_path}")
     if args.baseline_score is not None:
         print(f"Baseline:    {args.baseline_score:.4f}")
     print()

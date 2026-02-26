@@ -44,12 +44,22 @@ def _get_singleton_evaluator() -> "GeneSelectorEvaluator":
     """
     Return the module-level GeneSelectorEvaluator singleton, creating it on first call.
 
+    Reads DARWINSEQ_DATA_PATH and DARWINSEQ_VOCAB_PATH environment variables so
+    that scripts/run_evolution.py can pass custom paths without modifying this file.
+
     Returns:
         Shared GeneSelectorEvaluator instance.
     """
+    import os
+
     global _singleton_evaluator
     if _singleton_evaluator is None:
-        _singleton_evaluator = GeneSelectorEvaluator()
+        data_path = os.environ.get("DARWINSEQ_DATA_PATH") or None
+        vocab_path = os.environ.get("DARWINSEQ_VOCAB_PATH") or None
+        _singleton_evaluator = GeneSelectorEvaluator(
+            data_path=data_path,
+            vocab_path=vocab_path,
+        )
     return _singleton_evaluator
 
 
