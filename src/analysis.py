@@ -340,7 +340,8 @@ class GeneRetentionAnalyzer:
         )
 
         # Rank-biserial correlation: positive when evolution tends to be higher.
-        effect_size = float(1 - (2 * stat) / (n1 * n2))
+        # r = (2*U)/(n1*n2) - 1: equals +1 when all evolution > all baseline.
+        effect_size = float((2 * stat) / (n1 * n2) - 1)
 
         evo_ci = (
             (float(np.percentile(evolution_scores, 2.5)), float(np.percentile(evolution_scores, 97.5)))

@@ -223,3 +223,71 @@ class TestRankGenes:
         # All genes from our synthetic data: A B C D E F
         expected_genes = {"A", "B", "C", "D", "E", "F"}
         assert expected_genes == ranked_genes
+
+    def test_rank_genes_has_std_coef(self, tmp_path):
+        """rank_genes() output must include std_coef consistency column."""
+        results_dir = _make_3_gens(tmp_path)
+        analyzer = GeneRetentionAnalyzer(str(results_dir))
+
+        df = analyzer.rank_genes()
+        assert "std_coef" in df.columns
+
+        # Gene A coef: [0.4, 0.6, 0.0] → std > 0
+        a_row = df[df["gene"] == "A"].iloc[0]
+        assert a_row["std_coef"] > 0.0
+
+        # Gene C never in coef dict → std_coef == 0.0
+        c_row = df[df["gene"] == "C"].iloc[0]
+        assert c_row["std_coef"] == 0.0
+
+
+class TestCompareEvolutionVsBaseline:
+    def test_compare_evolution_vs_baseline_basic(self, tmp_path):
+        """High evolution scores vs low baseline → evolution_mean > baseline_mean and valid result."""
+        results_dir = _make_3_gens(tmp_path)
+        # Our synthetic gens have scores [0.30, 0.45, 0.50]
+        analyzer = GeneRetentionAnalyzer(str(results_dir))
+
+        baseline_scores = [0.10, 0.12, 0.11, 0.13, 0.09]
+        result = analyzer.compare_evolution_vs_baseline(baseline_scores)
+
+        assert "evolution_mean" in result
+        assert "baseline_mean" in result
+        assert "p_value" in result
+        assert "effect_size_rank_biserial" in result
+        assert "n_evolution" in result
+        assert "n_baseline" in result
+        assert "statistic" in result
+        assert "evolution_ci_95" in result
+        assert "baseline_ci_95" in result
+
+        # Evolution (mean ≈ 0.42) clearly above baseline (mean ≈ 0.11)
+        assert result["evolution_mean"] > result["baseline_mean"]
+        assert result["n_evolution"] == 3
+        assert result["n_baseline"] == 5
+        # Effect size should be positive (evolution > baseline)
+        assert result["effect_size_rank_biserial"] > 0
+
+    def test_compare_evolution_vs_baseline_empty_evolution(self, tmp_path):
+        """Empty results dir → returns dict with NaN values, no exception."""
+        empty_dir = tmp_path / "empty"
+        empty_dir.mkdir()
+        analyzer = GeneRetentionAnalyzer(str(empty_dir))
+
+        result = analyzer.compare_evolution_vs_baseline([0.25, 0.26, 0.24])
+
+        import math
+        assert math.isnan(result["evolution_mean"])
+        assert math.isnan(result["p_value"])
+        assert result["n_evolution"] == 0
+
+    def test_compare_evolution_vs_baseline_empty_baseline(self, tmp_path):
+        """Empty baseline list → returns dict with NaN values, no exception."""
+        results_dir = _make_3_gens(tmp_path)
+        analyzer = GeneRetentionAnalyzer(str(results_dir))
+
+        result = analyzer.compare_evolution_vs_baseline([])
+
+        import math
+        assert math.isnan(result["p_value"])
+        assert result["n_baseline"] == 0
